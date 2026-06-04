@@ -5,21 +5,11 @@
  */
 
 /**
- * Generates a random unique 6-digit fallback ID in the format UPCXXXXXX.
- * Used when a real UPC could not be extracted from the product page.
- * 
- * @returns {string} E.g., "UPC583920"
- */
-function generateUPC() {
-  const randomNum = Math.floor(100000 + Math.random() * 900000);
-  return `UPC${randomNum}`;
-}
-
-/**
  * Formats a premium product post to display in Telegram.
  * Omits the Expiration date field if it is not specified or resolves to "N/A".
+ * Omits the UPC field if it is not found.
  * 
- * @param {string} productId The unique product identifier (UPC barcode or fallback UPC ID).
+ * @param {string|null} productId The unique product identifier (UPC barcode).
  * @param {object} parsedData Object containing price, units, exp, and link.
  * @param {string|null} imageUrl Scraped image URL for the product.
  * @returns {string} The formatted text post for Telegram.
@@ -27,7 +17,10 @@ function generateUPC() {
 function generatePost(productId, parsedData, imageUrl) {
   const cleanImage = imageUrl || 'Not Found';
   
-  let post = `UPC: ${productId}  \n`;
+  let post = '';
+  if (productId) {
+    post += `UPC: ${productId}  \n`;
+  }
   post += `Price: ${parsedData.price}  \n`;
   post += `Units: ${parsedData.units}  \n`;
   
@@ -43,6 +36,5 @@ function generatePost(productId, parsedData, imageUrl) {
 }
 
 module.exports = {
-  generateUPC,
   generatePost
 };

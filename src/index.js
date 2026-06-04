@@ -17,7 +17,7 @@ const { BOT_TOKEN } = require('./config');
 const { splitMessageIntoProducts, parseMessage } = require('./parser');
 const { expandUrl, extractASIN, extractProductKey } = require('./urlHelper');
 const { scrapeProductData } = require('./scraper');
-const { generateUPC, generatePost } = require('./formatter');
+const { generatePost } = require('./formatter');
 
 
 // Warn if token is still placeholder
@@ -100,19 +100,16 @@ bot.on('message', async (msg) => {
         }
       }
 
-      // 6. Determine UPC: use real UPC scraped from product page, or generate fallback
+      // 6. Determine UPC: use real UPC scraped from product page
       const upc = scrapedData ? scrapedData.upc : null;
-      let productId;
       if (upc) {
-        productId = upc;
-        console.log(`🆔 Using real product UPC: ${productId}`);
+        console.log(`🆔 Using real product UPC: ${upc}`);
       } else {
-        productId = generateUPC();
-        console.log(`🆔 Real UPC not found — generated fallback: ${productId}`);
+        console.log('🆔 Real UPC not found on page.');
       }
 
       // 7. Format premium post (uses original short link from parsedData.link)
-      const formattedPost = generatePost(productId, parsedData, scrapedImageUrl);
+      const formattedPost = generatePost(upc, parsedData, scrapedImageUrl);
 
       // 8. Photo Sending Logic with fallbacks
       let photoToSend = null;
