@@ -18,7 +18,7 @@ const { splitMessageIntoProducts, parseMessage } = require('./parser');
 const { expandUrl, extractASIN, extractProductKey } = require('./urlHelper');
 const { scrapeProductData } = require('./scraper');
 const { generateUPC, generatePost } = require('./formatter');
-const { checkAndAddProductKey } = require('./dedupe');
+
 
 // Warn if token is still placeholder
 if (BOT_TOKEN === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
@@ -71,15 +71,8 @@ bot.on('message', async (msg) => {
       const expandedLink = await expandUrl(parsedData.link);
       console.log(`   Expanded URL: ${expandedLink}`);
 
-      // 4. Deduplication Check using product keys (ASIN, eBay ID, etc.)
-      const productKey = extractProductKey(expandedLink);
-      const isNew = checkAndAddProductKey(productKey);
-      
-      if (!isNew) {
-        console.log(`   ⚠️  Skipping: Product key "${productKey}" has already been processed.`);
-        continue;
-      }
-      console.log(`   Deduplication: Unique product key "${productKey}" checked & registered.`);
+
+
 
       // Extract ASIN log for Amazon urls
       const asin = extractASIN(expandedLink);
