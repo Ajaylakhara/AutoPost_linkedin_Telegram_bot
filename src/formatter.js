@@ -29,6 +29,11 @@ function generatePost(productId, parsedData, imageUrl) {
     post += `Exp: ${parsedData.exp}  \n`;
   }
   
+  // Omit FOB field if not provided or resolves to "N/A"
+  if (parsedData.fob && parsedData.fob.toUpperCase() !== 'N/A') {
+    post += `FOB: ${parsedData.fob}  \n`;
+  }
+  
   post += `Link: ${parsedData.link}  \n`;
   post += `Image: ${cleanImage}`;
   

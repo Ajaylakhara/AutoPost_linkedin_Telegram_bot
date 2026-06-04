@@ -137,11 +137,19 @@ function parseMessage(text) {
     exp = expMatch[1].trim();
   }
 
+  // 5. Extract FOB location (e.g. FOB - CA or FOB: Texas)
+  let fob = 'N/A';
+  const fobMatch = text.match(/\bFOB\s*[:\-]?\s*([^\n\r]+)/i);
+  if (fobMatch && fobMatch[1].trim()) {
+    fob = fobMatch[1].trim();
+  }
+
   return {
     link: linkMatch[0],
     price,
     units,
-    exp
+    exp,
+    fob
   };
 }
 
