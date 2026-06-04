@@ -1,0 +1,12 @@
+# Dependency directories
+node_modules/
+
+# Local databases and state files
+crawled_asins.json
+
+# Environment variables (sensitive data)
+.env
+
+# System files
+.DS_Store
+Thumbs.db
