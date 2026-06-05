@@ -20,18 +20,32 @@ const { scrapeProductData } = require('./scraper');
 const { generatePost } = require('./formatter');
 
 
-// Warn if token is still placeholder
-if (BOT_TOKEN === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
-  console.warn('\n⚠️  WARNING: You are using the default placeholder token.');
-  console.warn('   Please configure the BOT_TOKEN environment variable.\n');
+
+// Initialize Telegram bot: Webhook in production (Render), Polling in local development
+const isProduction = !!process.env.RENDER_EXTERNAL_URL;
+let bot;
+
+if (isProduction) {
+  bot = new TelegramBot(BOT_TOKEN, { polling: false });
+  const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/telegram-webhook`;
+  bot.setWebHook(webhookUrl)
+    .then(() => console.log(`📡 Webhook successfully set to ${webhookUrl}`))
+    .catch(err => console.error('❌ Error setting webhook:', err.message));
+} else {
+  bot = new TelegramBot(BOT_TOKEN, { polling: true });
+  console.log('🤖 Telegram Product Formatter Bot is starting up in POLLING mode...');
+  console.log('📡 Listening for incoming group/private messages...');
+  console.log('--------------------------------------------------');
 }
 
-// Initialize Telegram bot in polling mode
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-console.log('🤖 Telegram Product Formatter Bot is starting up...');
-console.log('📡 Listening for incoming group/private messages...');
-console.log('--------------------------------------------------');
+// Add simple command handler to test connection
+bot.onText(/\/test/, (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, `👋 Hello! The bot is active and successfully receiving messages.\n\n` +
+    `Chat Type: ${msg.chat.type}\n` +
+    `Chat ID: ${chatId}\n` +
+    `Mode: ${isProduction ? 'Webhook (Render)' : 'Polling (Local)'}`);
+});
 
 // Handle incoming messages
 bot.on('message', async (msg) => {
@@ -42,6 +56,11 @@ bot.on('message', async (msg) => {
 
     // Extract text body or photo caption
     const rawText = msg.text || msg.caption || '';
+    
+    // Ignore commands (messages starting with /) in the general message handler
+    if (rawText.trim().startsWith('/')) {
+      return;
+    }
     
     // Ignore small messages silently
     if (rawText.trim().length < 10) {
@@ -147,9 +166,26 @@ bot.on('polling_error', (error) => {
   console.error(`Error Code: ${error.code}`);
   console.error(`Message:    ${error.message}`);
   
-  if (error.message && error.message.includes('401 Unauthorized')) {
-    console.error('\n💡 TIP: Code 401 Unauthorized means your BOT_TOKEN is invalid.');
+  if (error.message && error.message.includes('401')) {
+    console.error('\n💡 TIP: Code 401 Unauthorized means your BOT_TOKEN is invalid. Please check your .env configuration.');
+  } else if (error.message && error.message.includes('404')) {
+    console.error('\n💡 TIP: Code 404 Not Found means the Telegram API endpoint is incorrect or the bot token is invalid.');
   }
+  console.error('--------------------------------------------------');
+});
+
+// Webhook Error handling
+bot.on('webhook_error', (error) => {
+  console.error('\n⚠️  Webhook Error occurred:');
+  console.error(`Error Code: ${error.code}`);
+  console.error(`Message:    ${error.message}`);
+  console.error('--------------------------------------------------');
+});
+
+// General Error handling
+bot.on('error', (error) => {
+  console.error('\n❌ General Bot Error occurred:');
+  console.error(error.stack || error.message || error);
   console.error('--------------------------------------------------');
 });
 
@@ -161,3 +197,5 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (error) => {
   console.error('❌ Uncaught Exception:', error);
 });
+
+module.exports = { bot };
