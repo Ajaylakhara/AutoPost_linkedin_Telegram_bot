@@ -1,5 +1,5 @@
 /**
- * 🤖 AutoPost LinkedIn & Telegram Bot (Main Orchestrator)
+ * 🤖 AutoPost Telegram Bot (Main Orchestrator)
  * 
  * Flow:
  * 1. Runs an Express HTTP server (health check + Telegram webhooks).
@@ -8,15 +8,15 @@
  * 4. Parses deals using utils.js.
  * 5. Scrapes product details (title, image, UPC) using scraper.js.
  * 6. Formats deal messages.
- * 7. Automatically posts to Telegram and LinkedIn.
+ * 7. Automatically posts to Telegram.
  */
 
 require('dotenv').config();
 const express = require('express');
+const https = require('https');
 const TelegramBot = require('node-telegram-bot-api');
-const { parseMessage, checkAndAddProductKey } = require('./utils');
-const { scrapeProductData, extractProductKey } = require('./scraper');
-const { publishPost } = require('./linkedin');
+const { parseMessage } = require('./utils');
+const { scrapeProductData } = require('./scraper');
 
 // Express App Initialization
 const app = express();
@@ -66,7 +66,7 @@ app.listen(PORT, () => {
 
 // Telegram Command Helpers
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '👋 Welcome! Send me product deals, and I will format and post them to LinkedIn & Telegram.');
+  bot.sendMessage(msg.chat.id, '👋 Welcome! Send me product deals, and I will format and post them to Telegram.');
 });
 
 bot.onText(/\/test/, (msg) => {
@@ -89,6 +89,13 @@ bot.on('message', async (msg) => {
     const products = parseMessage(rawText);
     if (!products || products.length === 0) {
       console.log('⚠️ No product links found in message.');
+      try {
+        await bot.sendMessage(msg.chat.id, '⚠️ No product links found in your message. Please include a product link (e.g. Amazon or Walmart).', {
+          reply_to_message_id: msg.message_id
+        });
+      } catch (tgErr) {
+        console.error('❌ Failed to send no-links warning to Telegram:', tgErr.message);
+      }
       return;
     }
 
@@ -98,71 +105,70 @@ bot.on('message', async (msg) => {
     for (const product of products) {
       console.log(`   Processing Link: ${product.link}`);
 
-      // Deduplication check
-      const productKey = extractProductKey(product.link);
-      const isNew = checkAndAddProductKey(productKey);
-      if (!isNew) {
-        console.log(`⚠️ Product already posted previously (${productKey}). Skipping.`);
-        continue;
-      }
-
       // Scrape product details
       console.log('   Scraping details...');
       const scraped = await scrapeProductData(product.link);
       console.log(`   Scraped: "${scraped.title}" (UPC: ${scraped.upc})`);
 
-      // Format output message exactly as requested
-      const formattedPost = 
+      // Telegram specific format without the redundant/empty Image line
+      const formattedTelegramPost = 
         `UPC: ${scraped.upc}\n` +
         `Price: ${product.price}\n` +
         `Units: ${product.units}\n` +
-        `Exp: ${product.exp}\n` +
-        `Link: ${product.link}\n` +
         `FOB: ${product.fob}\n` +
-        `Image: ${scraped.imageUrl || ''}`;
+        `Exp: ${product.exp}\n` +
+        `Link: ${product.link}`;
+
+      const telegramOptions = {
+        reply_to_message_id: msg.message_id
+      };
 
       // 3. Send to Telegram
       console.log('   Sending to Telegram...');
       try {
         if (scraped.imageUrl) {
           await bot.sendPhoto(msg.chat.id, scraped.imageUrl, {
-            caption: formattedPost,
-            reply_to_message_id: msg.message_id
+            caption: formattedTelegramPost,
+            ...telegramOptions
           });
         } else {
-          await bot.sendMessage(msg.chat.id, formattedPost, {
-            reply_to_message_id: msg.message_id
-          });
+          await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
         }
         console.log('   ✅ Telegram post successful.');
       } catch (tgErr) {
         console.error('   ❌ Telegram posting failed:', tgErr.message);
         // Fallback to plain text message
         try {
-          await bot.sendMessage(msg.chat.id, formattedPost, {
-            reply_to_message_id: msg.message_id
-          });
+          await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
           console.log('   ✅ Telegram post fallback successful.');
         } catch (fbErr) {
           console.error('   ❌ Telegram fallback failed:', fbErr.message);
         }
       }
-
-      // 4. Send to LinkedIn
-      console.log('   Posting to LinkedIn...');
-      try {
-        const success = await publishPost(formattedPost);
-        if (success) {
-          console.log('   ✅ LinkedIn post successful.');
-        } else {
-          console.warn('   ⚠️ LinkedIn post unsuccessful (check credentials or scope).');
-        }
-      } catch (liErr) {
-        console.error('   ❌ LinkedIn post execution failed:', liErr.message);
-      }
     }
 
   } catch (err) {
     console.error('❌ Error handling telegram message:', err.message);
+    try {
+      await bot.sendMessage(msg.chat.id, `❌ Error processing your message: ${err.message}`, {
+        reply_to_message_id: msg.message_id
+      });
+    } catch (tgErr) {
+      console.error('❌ Failed to send error message to Telegram:', tgErr.message);
+    }
   }
 });
+
+// Keep-alive self-pinging to prevent Render free tier from going to sleep
+if (isProduction && process.env.RENDER_EXTERNAL_URL) {
+  const pingUrl = process.env.RENDER_EXTERNAL_URL;
+  console.log(`⏱️ Setting up keep-alive self-ping for: ${pingUrl} (every 10 minutes)`);
+  setInterval(() => {
+    https.get(pingUrl, (res) => {
+      console.log(`Self-ping sent. Status Code: ${res.statusCode}`);
+    }).on('error', (err) => {
+      console.error('Self-ping error:', err.message);
+    });
+  }, 600000); // 10 minutes
+}
+

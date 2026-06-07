@@ -95,15 +95,32 @@ async function scrapeProductData(url) {
 
   try {
     const expandedUrl = await expandUrl(url);
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'max-age=0'
+    };
+
+    if (expandedUrl.includes('amazon.com')) {
+      headers['device-memory'] = '8';
+      headers['downlink'] = '10';
+      headers['ect'] = '4g';
+      headers['rtt'] = '50';
+      headers['sec-ch-ua'] = '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"';
+      headers['sec-ch-ua-mobile'] = '?0';
+      headers['sec-ch-ua-platform'] = '"Windows"';
+      headers['sec-fetch-dest'] = 'document';
+      headers['sec-fetch-mode'] = 'navigate';
+      headers['sec-fetch-site'] = 'none';
+      headers['sec-fetch-user'] = '?1';
+      headers['upgrade-insecure-requests'] = '1';
+    }
+
     const response = await axios.get(expandedUrl, {
       timeout: 10000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Cache-Control': 'max-age=0'
-      }
+      headers
     });
 
     const html = response.data;
