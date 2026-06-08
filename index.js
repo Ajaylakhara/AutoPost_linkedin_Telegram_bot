@@ -1,14 +1,19 @@
 /**
  * 🤖 AutoPost Telegram Bot (Main Orchestrator)
- * 
+ *
  * Flow:
  * 1. Runs an Express HTTP server (health check + Telegram webhooks).
- * 2. Connects to Telegram using webhook (in production) or polling (local development).
+ * 2. Connects to Telegram using webhook (in production) or polling (local dev).
  * 3. Listens for incoming product deal messages.
  * 4. Parses deals using utils.js.
- * 5. Scrapes product details (title, image, UPC) using scraper.js.
+ * 5. Scrapes product details (title, image, UPC) using scraper.js with timeout.
  * 6. Formats deal messages.
- * 7. Automatically posts to Telegram.
+ * 7. Automatically posts to Telegram — ALWAYS responds, even on scrape failure.
+ *
+ * FIX LOG:
+ *  - Bot froze with no reply when scraper hung → Added 22s hard timeout.
+ *  - Bot replied to its own messages creating loops → Added is_bot guard.
+ *  - Added process crash guards (unhandledRejection, uncaughtException).
  */
 
 require('dotenv').config();
@@ -22,6 +27,16 @@ const { scrapeProductData } = require('./scraper');
 const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
+
+// ── Crash Guards (prevent the process from dying silently) ─────────────────────
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ Unhandled Promise Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception:', err.message);
+  // Don't exit — keep the bot alive
+});
 
 // Telegram Bot Configuration
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -47,7 +62,7 @@ if (isProduction) {
 
 // HTTP Server Endpoints
 app.get('/', (req, res) => {
-  res.send('Bot running');
+  res.send('Bot running ✅');
 });
 
 app.post('/telegram-webhook', (req, res) => {
@@ -59,7 +74,7 @@ app.post('/telegram-webhook', (req, res) => {
   res.sendStatus(200);
 });
 
-// Start keep-alive Express Server
+// Start Express Server
 app.listen(PORT, () => {
   console.log(`📡 Express server listening on port ${PORT}`);
 });
@@ -73,55 +88,77 @@ bot.onText(/\/test/, (msg) => {
   bot.sendMessage(msg.chat.id, `⚙️ Bot is operational.\nMode: ${isProduction ? 'Webhook (Render)' : 'Polling (Local)'}`);
 });
 
-// Main Message Listener
+// ── Scrape with Hard Timeout ──────────────────────────────────────────────────
+// If scraping takes more than 22 seconds, return safe defaults so the bot
+// ALWAYS posts the deal card (without image/UPC) instead of going silent.
+const SCRAPE_TIMEOUT_MS = 22000;
+
+async function scrapeWithTimeout(url) {
+  const timeoutPromise = new Promise((resolve) =>
+    setTimeout(() => {
+      console.log(`   ⏱️ Scrape timeout reached for: ${url}`);
+      resolve({ title: 'Product', imageUrl: '', upc: 'Not Found' });
+    }, SCRAPE_TIMEOUT_MS)
+  );
+
+  return Promise.race([
+    scrapeProductData(url),
+    timeoutPromise
+  ]);
+}
+
+// ── Main Message Listener ─────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   try {
-    // ── Skip bot messages (including our own replies) ──────────────────────
+    // Skip bot messages (including our own replies) — prevents infinite loops
     if (msg.from && msg.from.is_bot) {
       return;
     }
 
-    // ── Skip service messages (joins, leaves, pins, etc.) ─────────────────
+    // Skip service/system messages (join, leave, pin, etc.)
     if (!msg.text && !msg.caption) {
       return;
     }
 
     const rawText = msg.text || msg.caption || '';
 
-    // Ignore bot command slash-prefix and extremely short inputs
+    // Ignore slash commands and very short messages
     if (rawText.trim().startsWith('/') || rawText.trim().length < 5) {
       return;
     }
 
-    console.log(`\n📬 [Message Received] Processing deal content from user...`);
+    console.log(`\n📬 [Message Received] Chat: ${msg.chat.id} | From: ${msg.from?.username || msg.from?.first_name}`);
 
-    // 1. Parse products array
+    // 1. Parse products from message text
     const products = parseMessage(rawText);
     if (!products || products.length === 0) {
       console.log('⚠️ No product links found in message.');
       try {
-        await bot.sendMessage(msg.chat.id, '⚠️ No product links found in your message. Please include a product link (e.g. Amazon or Walmart).', {
-          reply_to_message_id: msg.message_id
-        });
+        await bot.sendMessage(
+          msg.chat.id,
+          '⚠️ No product links found. Please include an Amazon or Walmart URL.',
+          { reply_to_message_id: msg.message_id }
+        );
       } catch (tgErr) {
-        console.error('❌ Failed to send no-links warning to Telegram:', tgErr.message);
+        console.error('❌ Failed to send no-links warning:', tgErr.message);
       }
       return;
     }
 
     console.log(`🔎 Found ${products.length} product(s) in message.`);
 
-    // 2. Loop each product
+    // 2. Process each product link
     for (const product of products) {
       console.log(`   Processing Link: ${product.link}`);
+      console.log(`   Parsed → Price: ${product.price} | Units: ${product.units} | FOB: ${product.fob}`);
 
-      // Scrape product details
-      console.log('   Scraping details...');
-      const scraped = await scrapeProductData(product.link);
-      console.log(`   Scraped: "${scraped.title}" (UPC: ${scraped.upc})`);
+      // Scrape with hard timeout — bot will ALWAYS respond
+      console.log('   Scraping details (max 22s)...');
+      const scraped = await scrapeWithTimeout(product.link);
+      console.log(`   Scraped → Title: "${scraped.title.substring(0, 40)}" | UPC: ${scraped.upc} | Image: ${scraped.imageUrl ? 'YES' : 'NO'}`);
 
-      // Telegram specific format without the redundant/empty Image line
-      const formattedTelegramPost = 
+      // Format the deal card message
+      const formattedTelegramPost =
         `UPC: ${scraped.upc}\n` +
         `Price: ${product.price}\n` +
         `Units: ${product.units}\n` +
@@ -133,7 +170,7 @@ bot.on('message', async (msg) => {
         reply_to_message_id: msg.message_id
       };
 
-      // 3. Send to Telegram
+      // 3. Send to Telegram — try with image first, fallback to text
       console.log('   Sending to Telegram...');
       try {
         if (scraped.imageUrl) {
@@ -141,44 +178,45 @@ bot.on('message', async (msg) => {
             caption: formattedTelegramPost,
             ...telegramOptions
           });
+          console.log('   ✅ Sent with photo.');
         } else {
           await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
+          console.log('   ✅ Sent as text (no image).');
         }
-        console.log('   ✅ Telegram post successful.');
       } catch (tgErr) {
-        console.error('   ❌ Telegram posting failed:', tgErr.message);
-        // Fallback to plain text message
+        console.error('   ❌ Photo send failed:', tgErr.message, '— falling back to text');
         try {
           await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
-          console.log('   ✅ Telegram post fallback successful.');
+          console.log('   ✅ Fallback text sent.');
         } catch (fbErr) {
-          console.error('   ❌ Telegram fallback failed:', fbErr.message);
+          console.error('   ❌ Text fallback also failed:', fbErr.message);
         }
       }
     }
 
   } catch (err) {
-    console.error('❌ Error handling telegram message:', err.message);
+    console.error('❌ Error handling message:', err.message);
     try {
-      await bot.sendMessage(msg.chat.id, `❌ Error processing your message: ${err.message}`, {
-        reply_to_message_id: msg.message_id
-      });
+      await bot.sendMessage(
+        msg.chat.id,
+        `❌ Error processing your message: ${err.message}`,
+        { reply_to_message_id: msg.message_id }
+      );
     } catch (tgErr) {
-      console.error('❌ Failed to send error message to Telegram:', tgErr.message);
+      console.error('❌ Failed to send error message:', tgErr.message);
     }
   }
 });
 
-// Keep-alive self-pinging to prevent Render free tier from going to sleep
+// ── Keep-alive self-pinging (prevents Render free tier from sleeping) ──────────
 if (isProduction && process.env.RENDER_EXTERNAL_URL) {
   const pingUrl = process.env.RENDER_EXTERNAL_URL;
-  console.log(`⏱️ Setting up keep-alive self-ping for: ${pingUrl} (every 10 minutes)`);
+  console.log(`⏱️ Keep-alive ping active → ${pingUrl} (every 10 min)`);
   setInterval(() => {
     https.get(pingUrl, (res) => {
-      console.log(`Self-ping sent. Status Code: ${res.statusCode}`);
+      console.log(`Keep-alive ping: ${res.statusCode}`);
     }).on('error', (err) => {
-      console.error('Self-ping error:', err.message);
+      console.error('Keep-alive ping error:', err.message);
     });
   }, 600000); // 10 minutes
 }
-
