@@ -340,15 +340,15 @@ async function scrapeProductData(url) {
     const isAmazon = expandedUrl.includes('amazon.com');
     const isWalmart = expandedUrl.includes('walmart.com');
 
-    // ── STEP 1: Extract ASIN for Amazon and pre-build image URL ──────────────
+    // ── STEP 1: Extract ASIN for Amazon (image CDN used as FINAL fallback) ─
+    // NOTE: We do NOT pre-set imageUrl here. HTML scraping runs first so that
+    // the real product image (og:image, landingImage) takes priority over the
+    // generic ASIN CDN pattern which may return blank placeholder images.
     let asin = null;
     if (isAmazon) {
       asin = extractAsin(expandedUrl);
       if (asin) {
         console.log(`   [Scraper] ASIN detected: ${asin}`);
-        // Pre-set image from Amazon CDN — works without scraping
-        data.imageUrl = buildAmazonImageUrl(asin);
-        console.log(`   [Scraper] Pre-built image URL from ASIN`);
       }
     }
 
@@ -380,10 +380,23 @@ async function scrapeProductData(url) {
       parseHtml(html, expandedUrl, data);
     }
 
-    // ── STEP 4: Amazon ASIN image CDN fallback (if HTML scrape cleared it) ───
+    // ── STEP 4: Amazon ASIN image CDN fallback (only if HTML found nothing) ─
     if (isAmazon && asin && !data.imageUrl) {
-      data.imageUrl = buildAmazonImageUrl(asin);
-      console.log(`   [Scraper] Restored ASIN-based image URL`);
+      const asinImageUrl = buildAmazonImageUrl(asin);
+      // Validate the CDN URL returns a real image (not a blank placeholder)
+      try {
+        const headRes = await axios.head(asinImageUrl, { timeout: 5000 });
+        const contentType = headRes.headers['content-type'] || '';
+        const contentLength = parseInt(headRes.headers['content-length'] || '0', 10);
+        if (contentType.includes('image') && contentLength > 2000) {
+          data.imageUrl = asinImageUrl;
+          console.log(`   [Scraper] ASIN CDN image validated OK (${contentLength} bytes)`);
+        } else {
+          console.log(`   [Scraper] ASIN CDN image rejected (type: ${contentType}, size: ${contentLength}) — no image`);
+        }
+      } catch (headErr) {
+        console.log(`   [Scraper] ASIN CDN head check failed: ${headErr.message}`);
+      }
     }
 
     // ── STEP 5: UPC Lookup via free API if still Not Found ───────────────────
