@@ -107,6 +107,16 @@ async function scrapeWithTimeout(url) {
   ]);
 }
 
+// ── Utility: Format unit numbers with comma separators ──────────────────────
+// Parsing strips commas ("2,124" → "2124") for clean numeric handling.
+// This re-adds them for display so the output reads "2,124" not "2124".
+function formatUnits(units) {
+  if (!units || units === 'N/A') return units;
+  const num = parseInt(units.toString().replace(/,/g, ''), 10);
+  if (isNaN(num)) return units;
+  return num.toLocaleString('en-US');
+}
+
 // ── Main Message Listener ─────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   try {
@@ -157,11 +167,11 @@ bot.on('message', async (msg) => {
       const scraped = await scrapeWithTimeout(product.link);
       console.log(`   Scraped → Title: "${scraped.title.substring(0, 40)}" | UPC: ${scraped.upc} | Image: ${scraped.imageUrl ? 'YES' : 'NO'}`);
 
-      // Format the deal card message
+      // Format the deal card message (units displayed with comma formatting)
       const formattedTelegramPost =
         `UPC: ${scraped.upc}\n` +
         `Price: ${product.price}\n` +
-        `Units: ${product.units}\n` +
+        `Units: ${formatUnits(product.units)}\n` +
         `FOB: ${product.fob}\n` +
         `Exp: ${product.exp}\n` +
         `Link: ${product.link}`;
