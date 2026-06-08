@@ -76,8 +76,18 @@ bot.onText(/\/test/, (msg) => {
 // Main Message Listener
 bot.on('message', async (msg) => {
   try {
+    // ── Skip bot messages (including our own replies) ──────────────────────
+    if (msg.from && msg.from.is_bot) {
+      return;
+    }
+
+    // ── Skip service messages (joins, leaves, pins, etc.) ─────────────────
+    if (!msg.text && !msg.caption) {
+      return;
+    }
+
     const rawText = msg.text || msg.caption || '';
-    
+
     // Ignore bot command slash-prefix and extremely short inputs
     if (rawText.trim().startsWith('/') || rawText.trim().length < 5) {
       return;

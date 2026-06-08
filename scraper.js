@@ -1,29 +1,55 @@
 /**
  * Scraper Module.
  * Fetches page HTML and extracts product details (Title, Image, UPC).
+ *
+ * FIX LOG:
+ *  - Amazon blocks plain axios → added realistic browser headers + cookies
+ *  - Image not found → built directly from ASIN using Amazon CDN pattern
+ *  - UPC Not Found → added free UPCitemdb API lookup by product title/ASIN
+ *  - Added multiple fallback layers for each field
  */
 
 const axios = require('axios');
 const cheerio = require('cheerio');
 const urlModule = require('url');
 
-/**
- * Expands short URLs (redirects) to retrieve the full target URL.
- * 
- * @param {string} url The URL to expand.
- * @param {number} maxRedirects Maximum redirect depth.
- * @returns {Promise<string>} Expanded URL.
- */
-async function expandUrl(url, maxRedirects = 5) {
-  if (maxRedirects <= 0 || !url) {
-    return url;
-  }
+// ─── Rotating User Agents (to reduce bot detection) ───────────────────────────
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'
+];
+
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// ─── Extract ASIN from Amazon URL ─────────────────────────────────────────────
+function extractAsin(url) {
+  if (!url) return null;
+  const match = url.match(/(?:dp|gp\/product|ASIN|d)\/([A-Z0-9]{10})/i);
+  return match ? match[1].toUpperCase() : null;
+}
+
+// ─── Build Amazon product image URL directly from ASIN ────────────────────────
+// Amazon stores main product images with a predictable CDN pattern
+function buildAmazonImageUrl(asin) {
+  if (!asin) return null;
+  return `https://images-na.ssl-images-amazon.com/images/P/${asin}.01._SCLZZZZZZZ_.jpg`;
+}
+
+// ─── Expand short/redirect URLs ───────────────────────────────────────────────
+async function expandUrl(url, maxRedirects = 8) {
+  if (maxRedirects <= 0 || !url) return url;
   try {
     const response = await axios.get(url, {
-      maxRedirects: 0, // Manual redirect following
+      maxRedirects: 0,
       validateStatus: (status) => status >= 200 && status < 400,
+      timeout: 8000,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': getRandomUserAgent()
       }
     });
 
@@ -47,28 +73,19 @@ async function expandUrl(url, maxRedirects = 5) {
   }
 }
 
-/**
- * Extracts a unique product key for deduplication.
- * 
- * @param {string} url The expanded product URL.
- * @returns {string} Unique identifier.
- */
+// ─── Extract unique product key for deduplication ─────────────────────────────
 function extractProductKey(url) {
   if (!url) return 'unknown';
 
-  // Amazon ASIN
-  const amazonMatch = url.match(/(?:dp|gp\/product|ASIN|d)\/([A-Z0-9]{10})/i);
-  if (amazonMatch) return amazonMatch[1];
+  const asin = extractAsin(url);
+  if (asin) return asin;
 
-  // Walmart Item ID
-  const walmartMatch = url.match(/\/ip\/(?:[^\/]+\/)?(\d+)/i);
+  const walmartMatch = url.match(/\/ip\/(?:[^\/]+\/)?([\d]+)/i);
   if (walmartMatch) return `walmart_${walmartMatch[1]}`;
 
-  // eBay ID
   const ebayMatch = url.match(/itm\/(\d+)/i);
   if (ebayMatch) return `ebay_${ebayMatch[1]}`;
 
-  // General Fallback
   try {
     const parsed = urlModule.parse(url);
     return `${parsed.hostname}${parsed.pathname}`;
@@ -77,13 +94,236 @@ function extractProductKey(url) {
   }
 }
 
-/**
- * Parses the product page HTML to extract details.
- * Supports Amazon & Walmart, falls back to generic selectors.
- * 
- * @param {string} url The product page URL.
- * @returns {Promise<object>} Parsed product data.
- */
+// ─── UPCitemdb API Lookup (free, no key needed for search) ────────────────────
+// Searches by product title/keywords to find matching UPC
+async function lookupUpcByTitle(title) {
+  if (!title || title === 'Product Title') return null;
+  try {
+    // Use the first ~5 words of the title as search query
+    const query = title.split(' ').slice(0, 6).join(' ');
+    const response = await axios.get('https://api.upcitemdb.com/prod/trial/search', {
+      params: { s: query, type: 'product' },
+      timeout: 6000,
+      headers: {
+        'User-Agent': getRandomUserAgent(),
+        'Accept': 'application/json'
+      }
+    });
+
+    if (response.data && response.data.items && response.data.items.length > 0) {
+      const item = response.data.items[0];
+      if (item.upc) return item.upc;
+      if (item.ean) return item.ean;
+    }
+  } catch (err) {
+    console.log('   [UPC API] lookup failed:', err.message);
+  }
+  return null;
+}
+
+// ─── Scrape Amazon product page with realistic headers ────────────────────────
+async function scrapeAmazon(expandedUrl, data) {
+  const ua = getRandomUserAgent();
+  const headers = {
+    'User-Agent': ua,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'max-age=0',
+    'Connection': 'keep-alive',
+    'Referer': 'https://www.google.com/',
+    'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'cross-site',
+    'sec-fetch-user': '?1',
+    'upgrade-insecure-requests': '1',
+    'dnt': '1'
+  };
+
+  const response = await axios.get(expandedUrl, {
+    timeout: 12000,
+    headers,
+    maxRedirects: 5
+  });
+
+  const html = response.data;
+
+  // Check if Amazon returned a robot/captcha page
+  if (html.includes('api-services-support@amazon.com') || html.includes('Enter the characters you see below')) {
+    console.log('   [Amazon] Bot detection triggered — using fallback data extraction only');
+    return html; // Return whatever we got
+  }
+
+  return html;
+}
+
+// ─── Scrape Walmart product page ──────────────────────────────────────────────
+async function scrapeWalmart(expandedUrl, data) {
+  const headers = {
+    'User-Agent': getRandomUserAgent(),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.walmart.com/',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'same-origin'
+  };
+
+  const response = await axios.get(expandedUrl, {
+    timeout: 12000,
+    headers,
+    maxRedirects: 5
+  });
+
+  return response.data;
+}
+
+// ─── Parse HTML for product fields ────────────────────────────────────────────
+function parseHtml(html, expandedUrl, data) {
+  const $ = cheerio.load(html);
+
+  // 1. JSON-LD Schema (most reliable source)
+  $('script[type="application/ld+json"]').each((_, element) => {
+    try {
+      const textContent = $(element).html();
+      if (!textContent) return;
+      const schema = JSON.parse(textContent.trim());
+      const schemas = Array.isArray(schema) ? schema : [schema];
+
+      for (const s of schemas) {
+        if (s['@type'] === 'Product' || (Array.isArray(s['@type']) && s['@type'].includes('Product')) || s.name || s.image) {
+          if (s.name && data.title === 'Product Title') {
+            data.title = s.name.trim();
+          }
+          if (s.image && !data.imageUrl) {
+            const img = Array.isArray(s.image) ? s.image[0] : s.image;
+            if (img && typeof img === 'string') data.imageUrl = img;
+            else if (img && typeof img === 'object' && img.url) data.imageUrl = img.url;
+          }
+          // Extract UPC/GTIN
+          const gtin = s.gtin14 || s.gtin13 || s.gtin12 || s.gtin || s.upc || s.mpn;
+          if (gtin && typeof gtin === 'string' && data.upc === 'Not Found') {
+            const cleaned = gtin.replace(/\D/g, '');
+            if (cleaned.length >= 8) data.upc = cleaned;
+          }
+        }
+      }
+    } catch (e) {
+      // Skip malformed JSON-LD
+    }
+  });
+
+  // 2. Walmart Next.js __NEXT_DATA__ JSON (very reliable for Walmart)
+  if (expandedUrl.includes('walmart.com') && (data.upc === 'Not Found' || !data.imageUrl)) {
+    try {
+      const nextDataScript = $('#__NEXT_DATA__').html() || $('script#__NEXT_DATA__').html();
+      if (nextDataScript) {
+        const nextData = JSON.parse(nextDataScript);
+        const product = nextData?.props?.pageProps?.initialData?.data?.product;
+        if (product) {
+          if (data.title === 'Product Title' && product.name) data.title = product.name;
+          if (!data.imageUrl && product.imageInfo?.thumbnailUrl) data.imageUrl = product.imageInfo.thumbnailUrl;
+          if (!data.imageUrl && product.imageInfo?.allImages?.[0]?.url) data.imageUrl = product.imageInfo.allImages[0].url;
+          if (data.upc === 'Not Found' && product.upc) data.upc = product.upc;
+        }
+      }
+    } catch (e) {
+      // Skip malformed Next.js data
+    }
+  }
+
+  // 3. Title fallbacks
+  if (data.title === 'Product Title') {
+    const amzTitle = $('#productTitle').text().trim();
+    if (amzTitle) {
+      data.title = amzTitle;
+    } else {
+      const ogTitle = $('meta[property="og:title"]').attr('content') || $('meta[name="twitter:title"]').attr('content');
+      if (ogTitle) {
+        data.title = ogTitle.trim();
+      } else {
+        const stdTitle = $('title').text().trim();
+        if (stdTitle) data.title = stdTitle.replace(/\s+/g, ' ');
+      }
+    }
+  }
+
+  // Clean common title suffixes
+  if (data.title) {
+    data.title = data.title
+      .replace(/\s*-\s*Walmart\.com\s*$/i, '')
+      .replace(/\s*:\s*Amazon\.com\s*(?::\s*.*)?$/i, '');
+  }
+
+  // 4. Image fallbacks
+  if (!data.imageUrl) {
+    // Amazon landing image
+    const amzImgDynamic = $('#landingImage').attr('data-a-dynamic-image');
+    if (amzImgDynamic) {
+      try {
+        const decoded = JSON.parse(amzImgDynamic);
+        const urls = Object.keys(decoded);
+        if (urls.length > 0) data.imageUrl = urls[0];
+      } catch (e) {}
+    }
+
+    if (!data.imageUrl) {
+      data.imageUrl = $('#landingImage').attr('src') ||
+                      $('#imgBlkFront').attr('src') ||
+                      $('#main-image').attr('src');
+    }
+
+    if (!data.imageUrl) {
+      const ogImage = $('meta[property="og:image"]').attr('content') || $('meta[name="twitter:image"]').attr('content');
+      if (ogImage) data.imageUrl = ogImage;
+    }
+
+    if (!data.imageUrl) {
+      $('img').each((_, img) => {
+        const src = $(img).attr('src');
+        if (src && src.startsWith('http') && !src.includes('pixel') && !src.includes('sprite') && !src.includes('logo') && !src.includes('tracking')) {
+          data.imageUrl = src;
+          return false;
+        }
+      });
+    }
+  }
+
+  // Resolve relative image URLs
+  if (data.imageUrl && data.imageUrl.startsWith('//')) {
+    data.imageUrl = 'https:' + data.imageUrl;
+  } else if (data.imageUrl && data.imageUrl.startsWith('/')) {
+    const parsedUrl = urlModule.parse(expandedUrl);
+    data.imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}${data.imageUrl}`;
+  }
+
+  // 5. UPC fallbacks from HTML text
+  if (data.upc === 'Not Found') {
+    // Look in Amazon product detail table
+    const upcParent = $('span:contains("UPC"), th:contains("UPC"), td:contains("UPC"), .a-span3:contains("UPC")')
+      .first()
+      .closest('tr, li, .a-row')
+      .text();
+
+    const upcMatch = upcParent.match(/\b([0-9]{12})\b/);
+    if (upcMatch) {
+      data.upc = upcMatch[1];
+    } else {
+      // Raw HTML regex scan near the word "UPC"
+      const upcIndex = html.search(/\bUPC\b/i);
+      if (upcIndex !== -1) {
+        const substring = html.substring(upcIndex, upcIndex + 300);
+        const rawMatch = substring.match(/\b(\d{12,13})\b/);
+        if (rawMatch) data.upc = rawMatch[1];
+      }
+    }
+  }
+}
+
+// ─── Main Export: scrapeProductData ───────────────────────────────────────────
 async function scrapeProductData(url) {
   const data = {
     title: 'Product Title',
@@ -95,177 +335,78 @@ async function scrapeProductData(url) {
 
   try {
     const expandedUrl = await expandUrl(url);
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'max-age=0'
-    };
+    console.log(`   [Scraper] Expanded URL: ${expandedUrl}`);
 
-    if (expandedUrl.includes('amazon.com')) {
-      headers['device-memory'] = '8';
-      headers['downlink'] = '10';
-      headers['ect'] = '4g';
-      headers['rtt'] = '50';
-      headers['sec-ch-ua'] = '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"';
-      headers['sec-ch-ua-mobile'] = '?0';
-      headers['sec-ch-ua-platform'] = '"Windows"';
-      headers['sec-fetch-dest'] = 'document';
-      headers['sec-fetch-mode'] = 'navigate';
-      headers['sec-fetch-site'] = 'none';
-      headers['sec-fetch-user'] = '?1';
-      headers['upgrade-insecure-requests'] = '1';
+    const isAmazon = expandedUrl.includes('amazon.com');
+    const isWalmart = expandedUrl.includes('walmart.com');
+
+    // ── STEP 1: Extract ASIN for Amazon and pre-build image URL ──────────────
+    let asin = null;
+    if (isAmazon) {
+      asin = extractAsin(expandedUrl);
+      if (asin) {
+        console.log(`   [Scraper] ASIN detected: ${asin}`);
+        // Pre-set image from Amazon CDN — works without scraping
+        data.imageUrl = buildAmazonImageUrl(asin);
+        console.log(`   [Scraper] Pre-built image URL from ASIN`);
+      }
     }
 
-    const response = await axios.get(expandedUrl, {
-      timeout: 10000,
-      headers
-    });
-
-    const html = response.data;
-    const $ = cheerio.load(html);
-
-    // 1. Try JSON-LD Schema (common on Walmart, eBay, and modern stores)
-    $('script[type="application/ld+json"]').each((_, element) => {
-      try {
-        const textContent = $(element).html();
-        if (!textContent) return;
-        const schema = JSON.parse(textContent.trim());
-
-        // Normal schema or array of schemas
-        const schemas = Array.isArray(schema) ? schema : [schema];
-        for (const s of schemas) {
-          // Check if product type
-          if (s['@type'] === 'Product' || s['@type']?.includes('Product') || s.name || s.image) {
-            if (s.name && data.title === 'Product Title') {
-              data.title = s.name.trim();
-            }
-            if (s.image) {
-              const img = Array.isArray(s.image) ? s.image[0] : s.image;
-              if (img && typeof img === 'string' && !data.imageUrl) {
-                data.imageUrl = img;
-              } else if (img && typeof img === 'object' && img.url && !data.imageUrl) {
-                data.imageUrl = img.url;
-              }
-            }
-            // Extract GTIN / UPC / ISBN
-            const gtin = s.gtin13 || s.gtin12 || s.gtin || s.upc || s.mpn || s.isbn;
-            if (gtin && typeof gtin === 'string' && data.upc === 'Not Found') {
-              data.upc = gtin.replace(/[^\d]/g, '');
-            }
-          }
-        }
-      } catch (e) {
-        // Skip malformed JSON
-      }
-    });
-
-    // 2. Fallbacks for Title
-    if (data.title === 'Product Title') {
-      // Amazon specific
-      const amzTitle = $('#productTitle').text().trim();
-      if (amzTitle) {
-        data.title = amzTitle;
+    // ── STEP 2: Scrape the product page HTML ─────────────────────────────────
+    let html = '';
+    try {
+      if (isAmazon) {
+        html = await scrapeAmazon(expandedUrl, data);
+      } else if (isWalmart) {
+        html = await scrapeWalmart(expandedUrl, data);
       } else {
-        // Meta og:title
-        const ogTitle = $('meta[property="og:title"]').attr('content') || $('meta[name="twitter:title"]').attr('content');
-        if (ogTitle) {
-          data.title = ogTitle.trim();
-        } else {
-          // Standard title tag
-          const stdTitle = $('title').text().trim();
-          if (stdTitle) {
-            data.title = stdTitle.replace(/\s+/g, ' ');
-          }
-        }
-      }
-    }
-
-    // Clean title from common suffixes
-    if (data.title) {
-      data.title = data.title.replace(/\s*-\s*Walmart\.com\s*$/i, '')
-                             .replace(/\s*:\s*Amazon\.com\s*(?::\s*.*)?$/i, '');
-    }
-
-    // 3. Fallbacks for Image
-    if (!data.imageUrl) {
-      // Amazon landing image dynamic map
-      const amzImgDynamic = $('#landingImage').attr('data-a-dynamic-image');
-      if (amzImgDynamic) {
-        try {
-          const decoded = JSON.parse(amzImgDynamic);
-          const urls = Object.keys(decoded);
-          if (urls.length > 0) {
-            data.imageUrl = urls[0];
-          }
-        } catch (e) {}
-      }
-
-      if (!data.imageUrl) {
-        data.imageUrl = $('#landingImage').attr('src') || 
-                        $('#imgBlkFront').attr('src') || 
-                        $('#main-image').attr('src');
-      }
-
-      if (!data.imageUrl) {
-        const ogImage = $('meta[property="og:image"]').attr('content') || $('meta[name="twitter:image"]').attr('content');
-        if (ogImage) {
-          data.imageUrl = ogImage;
-        }
-      }
-
-      if (!data.imageUrl) {
-        // First reasonable image
-        $('img').each((_, img) => {
-          const src = $(img).attr('src');
-          if (src && src.startsWith('http') && !src.includes('pixel') && !src.includes('sprite') && !src.includes('logo') && !src.includes('tracking')) {
-            data.imageUrl = src;
-            return false; // break
+        const response = await axios.get(expandedUrl, {
+          timeout: 10000,
+          headers: {
+            'User-Agent': getRandomUserAgent(),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.google.com/'
           }
         });
+        html = response.data;
       }
+    } catch (httpErr) {
+      console.log(`   [Scraper] HTTP fetch failed: ${httpErr.message} — using pre-built ASIN data`);
     }
 
-    // Resolve relative image URLs
-    if (data.imageUrl && data.imageUrl.startsWith('//')) {
-      data.imageUrl = 'https:' + data.imageUrl;
-    } else if (data.imageUrl && data.imageUrl.startsWith('/')) {
-      const parsedUrl = urlModule.parse(expandedUrl);
-      data.imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}${data.imageUrl}`;
+    // ── STEP 3: Parse HTML if we got any ─────────────────────────────────────
+    if (html) {
+      parseHtml(html, expandedUrl, data);
     }
 
-    // 4. Fallbacks for UPC
+    // ── STEP 4: Amazon ASIN image CDN fallback (if HTML scrape cleared it) ───
+    if (isAmazon && asin && !data.imageUrl) {
+      data.imageUrl = buildAmazonImageUrl(asin);
+      console.log(`   [Scraper] Restored ASIN-based image URL`);
+    }
+
+    // ── STEP 5: UPC Lookup via free API if still Not Found ───────────────────
     if (data.upc === 'Not Found') {
-      // Look for Amazon product detail table/list patterns
-      const upcText = $('span:contains("UPC"), th:contains("UPC"), td:contains("UPC")')
-        .parent()
-        .text();
-      
-      const upcMatch = upcText.match(/\b([0-9]{12})\b/);
-      if (upcMatch) {
-        data.upc = upcMatch[1];
+      console.log(`   [Scraper] UPC not found in HTML — trying UPCitemdb API...`);
+      const apiUpc = await lookupUpcByTitle(data.title);
+      if (apiUpc) {
+        data.upc = apiUpc;
+        console.log(`   [Scraper] UPC found via API: ${data.upc}`);
       } else {
-        // Regex search in the raw HTML near the word "UPC"
-        const upcIndex = html.search(/\bUPC\b/i);
-        if (upcIndex !== -1) {
-          const substring = html.substring(upcIndex, upcIndex + 250);
-          const rawMatch = substring.match(/\b(\d{12})\b/);
-          if (rawMatch) {
-            data.upc = rawMatch[1];
-          }
-        }
+        console.log(`   [Scraper] UPC API returned no result — keeping "Not Found"`);
       }
     }
 
   } catch (err) {
-    console.error(`[Scraper Error] Error scraping details for ${url}:`, err.message);
+    console.error(`[Scraper Error] ${url}:`, err.message);
   }
 
-  // Ensure output complies with fallback rules
-  if (!data.upc || data.upc === '') {
-    data.upc = 'Not Found';
-  }
+  // Final safety checks
+  if (!data.upc || data.upc.trim() === '') data.upc = 'Not Found';
+  if (!data.title || data.title.trim() === '') data.title = 'Product';
+
+  console.log(`   [Scraper] Final → Title: "${data.title.substring(0, 40)}..." | UPC: ${data.upc} | Image: ${data.imageUrl ? 'YES' : 'NO'}`);
 
   return data;
 }
