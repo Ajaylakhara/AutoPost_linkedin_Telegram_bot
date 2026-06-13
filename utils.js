@@ -47,23 +47,31 @@ function extractPrice(text) {
  * Extracts unit count from text.
  * Supports:
  *   "Units: 3600", "Units - 3600", "3,600 Units Available", "120 Units"
+ *   "12k units", "12K", "1.5k units", "1.5K"
  * Returns null if not found.
  */
+function expandK(str) {
+  // Convert "12k" / "1.5K" → numeric string "12000" / "1500"
+  const m = str.replace(/,/g, '').match(/^(\d+(?:\.\d+)?)\s*[kK]$/);
+  if (m) return String(Math.round(parseFloat(m[1]) * 1000));
+  return str.replace(/,/g, '');
+}
+
 function extractUnits(text) {
-  // Format 1: "Units: 3600" or "Units - 3600" (label before number)
-  const prefixMatch = text.match(/Units?\s*[:\-]?\s*([\d,]+)/i);
-  if (prefixMatch) return prefixMatch[1].replace(/,/g, '');
+  // Format 1: "Units: 3600" or "Units - 3600" or "Units: 12k" (label before number)
+  const prefixMatch = text.match(/Units?\s*[:\-]?\s*([\d,]+(?:\.\d+)?[kK]?)/i);
+  if (prefixMatch) return expandK(prefixMatch[1]);
 
-  // Format 2: "3,600 Units Available" or "120 Units" (number before label)
-  const suffixMatch = text.match(/([\d,]+)\s+Units?/i);
-  if (suffixMatch) return suffixMatch[1].replace(/,/g, '');
+  // Format 2: "3,600 Units Available" or "120 Units" or "12k Units" (number before label)
+  const suffixMatch = text.match(/([\d,]+(?:\.\d+)?[kK]?)\s+Units?/i);
+  if (suffixMatch) return expandK(suffixMatch[1]);
 
-  // Format 3: Standalone number-only line (not a price)
+  // Format 3: Standalone number-only line (plain number or k-shorthand, not a price)
   const lines = text.split('\n');
   for (const line of lines) {
     const clean = line.trim();
-    if (/^[\d,]+$/.test(clean)) {
-      return clean.replace(/,/g, '');
+    if (/^[\d,]+(?:\.\d+)?[kK]?$/.test(clean) && !clean.startsWith('$')) {
+      return expandK(clean);
     }
   }
 

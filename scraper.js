@@ -177,21 +177,60 @@ function parseHtml(html, expandedUrl, data) {
     } catch (e) { /* skip malformed JSON-LD */ }
   });
 
-  // 2. Walmart __NEXT_DATA__ JSON
-  if (expandedUrl.includes('walmart.com') && (data.upc === 'Not Found' || !data.imageUrl)) {
-    try {
-      const nextDataScript = $('#__NEXT_DATA__').html() || $('script#__NEXT_DATA__').html();
-      if (nextDataScript) {
-        const nextData = JSON.parse(nextDataScript);
-        const product = nextData?.props?.pageProps?.initialData?.data?.product;
+  // 2. Walmart data extraction (multiple strategies)
+  if (expandedUrl.includes('walmart.com') && (data.upc === 'Not Found' || !data.imageUrl || data.title === 'Product Title')) {
+    // Strategy A: #__NEXT_DATA__ selector (older Walmart layout)
+    let nextDataScript = $('script[id="__NEXT_DATA__"]').html();
+
+    // Strategy B: scan all script tags for __NEXT_DATA__ JSON (newer Walmart layout)
+    if (!nextDataScript) {
+      $('script').each((_, el) => {
+        const content = $(el).html() || '';
+        if (content.includes('__NEXT_DATA__') || (content.includes('"props"') && content.includes('"pageProps"') && content.length > 10000)) {
+          nextDataScript = content;
+          return false; // break
+        }
+      });
+    }
+
+    if (nextDataScript) {
+      try {
+        // Walmart sometimes wraps the JSON in: self.__next_f.push([...]) or similar
+        // Try to extract the raw JSON object
+        let jsonStr = nextDataScript.trim();
+        if (!jsonStr.startsWith('{') && !jsonStr.startsWith('[')) {
+          const jsonMatch = jsonStr.match(/({[\s\S]+})/)
+          if (jsonMatch) jsonStr = jsonMatch[1];
+        }
+        const nextData = JSON.parse(jsonStr);
+        const product = nextData && nextData.props && nextData.props.pageProps &&
+                        nextData.props.pageProps.initialData && nextData.props.pageProps.initialData.data &&
+                        nextData.props.pageProps.initialData.data.product;
         if (product) {
           if (data.title === 'Product Title' && product.name) data.title = product.name;
-          if (!data.imageUrl && product.imageInfo?.thumbnailUrl) data.imageUrl = product.imageInfo.thumbnailUrl;
-          if (!data.imageUrl && product.imageInfo?.allImages?.[0]?.url) data.imageUrl = product.imageInfo.allImages[0].url;
+          if (!data.imageUrl && product.imageInfo && product.imageInfo.thumbnailUrl) data.imageUrl = product.imageInfo.thumbnailUrl;
+          if (!data.imageUrl && product.imageInfo && product.imageInfo.allImages && product.imageInfo.allImages[0]) data.imageUrl = product.imageInfo.allImages[0].url || product.imageInfo.allImages[0];
           if (data.upc === 'Not Found' && product.upc) data.upc = product.upc;
         }
+      } catch (e) { /* skip malformed Next.js data */ }
+    }
+
+    // Strategy C: direct regex on raw HTML (most reliable for Walmart bot-resistant pages)
+    if (data.upc === 'Not Found' || !data.imageUrl || data.title === 'Product Title') {
+      const rawHtml = $.html();
+      if (data.upc === 'Not Found') {
+        const upcRx = rawHtml.match(/"upc"\s*:\s*"([^"]{8,14})"/);
+        if (upcRx) data.upc = upcRx[1];
       }
-    } catch (e) { /* skip malformed Next.js data */ }
+      if (!data.imageUrl) {
+        const thumbRx = rawHtml.match(/"thumbnailUrl"\s*:\s*"(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)"/i);
+        if (thumbRx) data.imageUrl = thumbRx[1].split('\\\\').join('/');
+      }
+      if (data.title === 'Product Title') {
+        const nameRx = rawHtml.match(/"productName"\s*:\s*"([^"]{5,200})"/);
+        if (nameRx) data.title = nameRx[1];
+      }
+    }
   }
 
   // 3. Title fallbacks
