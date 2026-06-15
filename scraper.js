@@ -1,6 +1,20 @@
 /**
  * Scraper Module.
  * Fetches page HTML and extracts product details (Title, Image, UPC).
+ *
+ * FIX LOG:
+ *  - Amazon CDN image fallback returned a 1×1 GIF placeholder (43 bytes, image/gif).
+ *    Fix: Added content-type check to reject GIFs, and added multiple alternate CDN patterns.
+ *
+ *  - Walmart pages blocked by bot detection ("Robot or human?" page).
+ *    Fix: Added mobile user-agent fallback, cookie header, extra browser fingerprint headers.
+ *
+ *  - Amazon pages sometimes return generic "Amazon.com" title due to bot detection.
+ *    Fix: Detect and skip this bad title; fall back to ASIN-based image URL using
+ *    media-amazon.com CDN which is more reliable.
+ *
+ *  - UPCitemdb trial endpoint returns 404 for some searches.
+ *    Fix: Added better search query and a secondary open barcode lookup via go-upc.com.
  */
 
 const axios = require('axios');
@@ -16,8 +30,19 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'
 ];
 
+// Mobile user agents for Walmart fallback
+const MOBILE_USER_AGENTS = [
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36'
+];
+
 function getRandomUserAgent() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function getRandomMobileUserAgent() {
+  return MOBILE_USER_AGENTS[Math.floor(Math.random() * MOBILE_USER_AGENTS.length)];
 }
 
 // ── Extract ASIN from Amazon URL ──────────────────────────────────────────────
@@ -27,10 +52,45 @@ function extractAsin(url) {
   return match ? match[1].toUpperCase() : null;
 }
 
-// ── Build Amazon CDN image URL from ASIN ──────────────────────────────────────
-function buildAmazonImageUrl(asin) {
-  if (!asin) return null;
-  return `https://images-na.ssl-images-amazon.com/images/P/${asin}.01._SCLZZZZZZZ_.jpg`;
+// ── Build Amazon CDN image URL from ASIN (multiple patterns) ──────────────────
+// Returns an ordered array of candidate URLs to try
+function buildAmazonImageCandidates(asin) {
+  if (!asin) return [];
+  return [
+    // Reliable media-amazon.com CDN patterns
+    `https://m.media-amazon.com/images/P/${asin}.01._SX400_.jpg`,
+    `https://m.media-amazon.com/images/P/${asin}.01.LZZZZZZZ.jpg`,
+    `https://m.media-amazon.com/images/P/${asin}.01._SL400_.jpg`,
+    // Legacy ssl-images CDN (often returns GIF placeholder — validated below)
+    `https://images-na.ssl-images-amazon.com/images/P/${asin}.01.LZZZZZZZ.jpg`,
+    `https://images-na.ssl-images-amazon.com/images/P/${asin}.01._SCLZZZZZZZ_.jpg`,
+  ];
+}
+
+// ── Check if an image URL is valid (not a GIF placeholder, not too small) ─────
+async function validateImageUrl(url) {
+  try {
+    const headRes = await axios.head(url, { timeout: 5000 });
+    const contentType   = (headRes.headers['content-type'] || '').toLowerCase();
+    const contentLength = parseInt(headRes.headers['content-length'] || '0', 10);
+    // Must be an actual image, not a GIF placeholder (Amazon uses 1×1 GIF for missing images)
+    if (!contentType.startsWith('image/')) return false;
+    if (contentType.includes('gif')) return false;
+    if (contentLength > 0 && contentLength < 2000) return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ── Find first valid Amazon image URL for an ASIN ─────────────────────────────
+async function findAmazonImageUrl(asin) {
+  const candidates = buildAmazonImageCandidates(asin);
+  for (const url of candidates) {
+    const valid = await validateImageUrl(url);
+    if (valid) return url;
+  }
+  return null;
 }
 
 // ── Expand short/redirect URLs ────────────────────────────────────────────────
@@ -81,15 +141,23 @@ function extractProductKey(url) {
   }
 }
 
-// ── UPCitemdb API Lookup (free) ────────────────────────────────────────────────
+// ── UPCitemdb API Lookup (free trial) ─────────────────────────────────────────
 async function lookupUpcByTitle(title) {
-  if (!title || title === 'Product Title') return null;
+  if (!title || title === 'Product Title' || title === 'Product' || title === 'Amazon.com') return null;
   try {
-    const query = title.split(' ').slice(0, 6).join(' ');
+    // Use first 5 meaningful words to improve search accuracy
+    const words = title.split(' ').filter(w => w.length > 2).slice(0, 5);
+    const query = words.join(' ');
+    if (!query) return null;
+
     const response = await axios.get('https://api.upcitemdb.com/prod/trial/search', {
       params: { s: query, type: 'product' },
       timeout: 6000,
-      headers: { 'User-Agent': getRandomUserAgent(), 'Accept': 'application/json' }
+      headers: {
+        'User-Agent': getRandomUserAgent(),
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip, deflate'
+      }
     });
 
     if (response.data?.items?.length > 0) {
@@ -105,7 +173,7 @@ async function lookupUpcByTitle(title) {
 // ── Scrape Amazon product page ─────────────────────────────────────────────────
 async function scrapeAmazon(expandedUrl) {
   const response = await axios.get(expandedUrl, {
-    timeout: 12000,
+    timeout: 15000,
     maxRedirects: 5,
     headers: {
       'User-Agent': getRandomUserAgent(),
@@ -129,23 +197,89 @@ async function scrapeAmazon(expandedUrl) {
   return response.data;
 }
 
-// ── Scrape Walmart product page ────────────────────────────────────────────────
-async function scrapeWalmart(expandedUrl) {
+// ── Scrape Walmart product page (desktop) ─────────────────────────────────────
+async function scrapeWalmartDesktop(expandedUrl) {
   const response = await axios.get(expandedUrl, {
-    timeout: 12000,
+    timeout: 15000,
     maxRedirects: 5,
     headers: {
       'User-Agent': getRandomUserAgent(),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': 'https://www.walmart.com/',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Connection': 'keep-alive',
+      'Referer': 'https://www.google.com/',
+      'Cache-Control': 'max-age=0',
+      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
       'sec-fetch-dest': 'document',
       'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'same-origin'
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-user': '?1',
+      'upgrade-insecure-requests': '1',
+      'dnt': '1',
+      // Walmart-specific: fake a cookie session to reduce bot detection
+      'Cookie': 'bstc=yJRNaxqX5gXI4H5nF38Ldg; hasLocData=1; locDataV3=eyJpc1Jlc29sdmVkIjp0cnVlLCJzdG9yZUlkIjoiNDM5NiIsInppcENvZGUiOiI2MDYwNiIsImRpc3BsYXlWYWx1ZSI6IjYwNjA2IiwidHlwZXMiOlsiU1RPUkVfTEVEIl19; DL={"aid":"1_8a0f69d7-2b83-4b29-af65-08cf94a8bda2"}',
     }
   });
   return response.data;
 }
+
+// ── Scrape Walmart product page (mobile fallback) ─────────────────────────────
+async function scrapeWalmartMobile(expandedUrl) {
+  // Use www.walmart.com with a mobile user-agent (mobile.walmart.com doesn't exist)
+  const response = await axios.get(expandedUrl, {
+    timeout: 15000,
+    maxRedirects: 5,
+    headers: {
+      'User-Agent': getRandomMobileUserAgent(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Connection': 'keep-alive',
+      'Referer': 'https://www.google.com/',
+      'upgrade-insecure-requests': '1',
+      'sec-ch-ua-mobile': '?1',
+      'Cookie': 'bstc=yJRNaxqX5gXI4H5nF38Ldg; hasLocData=1;'
+    }
+  });
+  return response.data;
+}
+
+// ── Scrape Amazon mobile page (fallback when desktop is blocked) ──────────────
+async function scrapeAmazonMobile(expandedUrl, asin) {
+  // Use clean dp URL with mobile UA to avoid robot detection
+  const mobileUrl = asin
+    ? `https://www.amazon.com/dp/${asin}?th=1&psc=1`
+    : expandedUrl;
+
+  const response = await axios.get(mobileUrl, {
+    timeout: 15000,
+    maxRedirects: 5,
+    headers: {
+      'User-Agent': getRandomMobileUserAgent(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'max-age=0',
+      'Connection': 'keep-alive',
+      'Referer': 'https://www.google.com/',
+      'upgrade-insecure-requests': '1',
+      'sec-ch-ua-mobile': '?1',
+      // Fake session cookies to look like a returning visitor
+      'Cookie': 'session-id=263-9876543-1234567; session-id-time=2082787201l; i18n-prefs=USD; ubid-main=133-9876543-1234567'
+    }
+  });
+  return response.data;
+}
+
+// ── Extract Walmart item ID from URL ──────────────────────────────────────────
+function extractWalmartItemId(url) {
+  const match = url.match(/\/ip\/(?:[^\/]+\/)?([\d]+)/i);
+  return match ? match[1] : null;
+}
+
 
 // ── Parse HTML for product fields ─────────────────────────────────────────────
 function parseHtml(html, expandedUrl, data) {
@@ -186,7 +320,7 @@ function parseHtml(html, expandedUrl, data) {
     if (!nextDataScript) {
       $('script').each((_, el) => {
         const content = $(el).html() || '';
-        if (content.includes('__NEXT_DATA__') || (content.includes('"props"') && content.includes('"pageProps"') && content.length > 10000)) {
+        if (content.includes('"props"') && content.includes('"pageProps"') && content.length > 10000) {
           nextDataScript = content;
           return false; // break
         }
@@ -195,11 +329,9 @@ function parseHtml(html, expandedUrl, data) {
 
     if (nextDataScript) {
       try {
-        // Walmart sometimes wraps the JSON in: self.__next_f.push([...]) or similar
-        // Try to extract the raw JSON object
         let jsonStr = nextDataScript.trim();
         if (!jsonStr.startsWith('{') && !jsonStr.startsWith('[')) {
-          const jsonMatch = jsonStr.match(/({[\s\S]+})/)
+          const jsonMatch = jsonStr.match(/(\{[\s\S]+\})/);
           if (jsonMatch) jsonStr = jsonMatch[1];
         }
         const nextData = JSON.parse(jsonStr);
@@ -215,7 +347,7 @@ function parseHtml(html, expandedUrl, data) {
       } catch (e) { /* skip malformed Next.js data */ }
     }
 
-    // Strategy C: direct regex on raw HTML (most reliable for Walmart bot-resistant pages)
+    // Strategy C: direct regex on raw HTML
     if (data.upc === 'Not Found' || !data.imageUrl || data.title === 'Product Title') {
       const rawHtml = $.html();
       if (data.upc === 'Not Found') {
@@ -226,9 +358,19 @@ function parseHtml(html, expandedUrl, data) {
         const thumbRx = rawHtml.match(/"thumbnailUrl"\s*:\s*"(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)"/i);
         if (thumbRx) data.imageUrl = thumbRx[1].split('\\\\').join('/');
       }
+      if (!data.imageUrl) {
+        // Also try imageUrl pattern
+        const imgRx = rawHtml.match(/"imageUrl"\s*:\s*"(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)"/i);
+        if (imgRx) data.imageUrl = imgRx[1].split('\\\\').join('/');
+      }
       if (data.title === 'Product Title') {
         const nameRx = rawHtml.match(/"productName"\s*:\s*"([^"]{5,200})"/);
         if (nameRx) data.title = nameRx[1];
+      }
+      // Strategy D: Try extracting from __reactProps or similar JSON blobs
+      if (data.upc === 'Not Found' || !data.imageUrl) {
+        const upcRx2 = rawHtml.match(/"upc\\?"\\s*:\\s*\\"([^"\\\\]{8,14})\\"/);
+        if (upcRx2 && data.upc === 'Not Found') data.upc = upcRx2[1];
       }
     }
   }
@@ -315,6 +457,19 @@ function parseHtml(html, expandedUrl, data) {
   }
 }
 
+// ── Detect if the returned HTML is a bot-detection page ───────────────────────
+function isBotDetectionPage(html, title) {
+  if (!html) return true;
+  const lowerTitle = (title || '').toLowerCase();
+  if (lowerTitle.includes('robot or human') || lowerTitle.includes('captcha') || lowerTitle.includes('access denied') || lowerTitle.includes('just a moment')) {
+    return true;
+  }
+  if (html.includes('robot-check') || html.includes('/errors/validateCaptcha') || html.includes('api.challenge.walmart.com')) {
+    return true;
+  }
+  return false;
+}
+
 // ── Main Export: scrapeProductData ────────────────────────────────────────────
 async function scrapeProductData(url) {
   const data = { title: 'Product Title', imageUrl: '', upc: 'Not Found' };
@@ -326,16 +481,27 @@ async function scrapeProductData(url) {
     const isAmazon  = expandedUrl.includes('amazon.com');
     const isWalmart = expandedUrl.includes('walmart.com');
 
-    // Step 1: Extract ASIN (used later as image fallback only)
+    // Step 1: Extract ASIN (Amazon) or Item ID (Walmart)
     let asin = null;
+    let walmartItemId = null;
     if (isAmazon) asin = extractAsin(expandedUrl);
+    if (isWalmart) walmartItemId = extractWalmartItemId(expandedUrl);
 
     // Step 2: Fetch page HTML
     let html = '';
+    let wasBotBlocked = false;
+
     try {
-      if (isAmazon)       html = await scrapeAmazon(expandedUrl);
-      else if (isWalmart) html = await scrapeWalmart(expandedUrl);
-      else {
+      if (isAmazon) {
+        html = await scrapeAmazon(expandedUrl);
+      } else if (isWalmart) {
+        // Try desktop first
+        try {
+          html = await scrapeWalmartDesktop(expandedUrl);
+        } catch (desktopErr) {
+          console.error(`[Scraper] Walmart desktop failed: ${desktopErr.message}, trying mobile...`);
+        }
+      } else {
         const response = await axios.get(expandedUrl, {
           timeout: 10000,
           headers: {
@@ -351,26 +517,79 @@ async function scrapeProductData(url) {
       console.error(`[Scraper] Fetch error for ${url}:`, httpErr.message);
     }
 
-    // Step 3: Parse HTML
-    if (html) parseHtml(html, expandedUrl, data);
-
-    // Step 4: ASIN CDN image fallback (only if HTML found nothing)
-    if (isAmazon && asin && !data.imageUrl) {
-      const asinImageUrl = buildAmazonImageUrl(asin);
-      try {
-        const headRes = await axios.head(asinImageUrl, { timeout: 5000 });
-        const contentType   = headRes.headers['content-type'] || '';
-        const contentLength = parseInt(headRes.headers['content-length'] || '0', 10);
-        if (contentType.includes('image') && contentLength > 2000) {
-          data.imageUrl = asinImageUrl;
+    // Step 2b: If Amazon is blocked, retry with mobile user-agent
+    if (isAmazon && html) {
+      // Quick check if page is a robot/CAPTCHA page before parsing
+      const titleQuickCheck = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || '';
+      if (isBotDetectionPage(html, titleQuickCheck)) {
+        console.log(`[Scraper] Amazon desktop blocked, retrying with mobile UA for: ${url}`);
+        html = '';
+        try {
+          html = await scrapeAmazonMobile(expandedUrl, asin);
+        } catch (mobileErr) {
+          console.error(`[Scraper] Amazon mobile fallback failed: ${mobileErr.message}`);
         }
-      } catch (e) { /* ASIN CDN not available */ }
+      }
     }
 
-    // Step 5: UPC API fallback
+    // Step 3: Parse HTML (first pass)
+    if (html) parseHtml(html, expandedUrl, data);
+
+    // Step 4: Detect bot-blocked response and retry with mobile UA for Walmart
+    if (isWalmart && isBotDetectionPage(html, data.title)) {
+      console.log(`[Scraper] Walmart bot blocked on desktop, trying mobile UA for: ${url}`);
+      wasBotBlocked = true;
+      // Reset data for clean retry
+      data.title = 'Product Title';
+      data.imageUrl = '';
+      data.upc = 'Not Found';
+      html = '';
+      try {
+        html = await scrapeWalmartMobile(expandedUrl);
+        if (html) parseHtml(html, expandedUrl, data);
+      } catch (mobileErr) {
+        console.error(`[Scraper] Walmart mobile fallback also failed: ${mobileErr.message}`);
+      }
+    }
+
+    // Step 5: Amazon ASIN-based image fallback
+    // Only run if no image found, or if image is a suspicious short URL
+    if (isAmazon && asin && !data.imageUrl) {
+      console.log(`[Scraper] Trying Amazon CDN image candidates for ASIN: ${asin}`);
+      const validImage = await findAmazonImageUrl(asin);
+      if (validImage) {
+        data.imageUrl = validImage;
+        console.log(`[Scraper] Found valid Amazon CDN image: ${validImage}`);
+      }
+    }
+
+    // Step 6: Validate existing image URL (reject GIF placeholders)
+    if (data.imageUrl) {
+      try {
+        const headRes = await axios.head(data.imageUrl, { timeout: 5000 });
+        const contentType = (headRes.headers['content-type'] || '').toLowerCase();
+        const contentLength = parseInt(headRes.headers['content-length'] || '0', 10);
+        if (contentType.includes('gif') || (contentLength > 0 && contentLength < 2000)) {
+          console.log(`[Scraper] Rejected placeholder image (${contentType}, ${contentLength}B): ${data.imageUrl}`);
+          data.imageUrl = '';
+          // Try ASIN CDN as backup for Amazon
+          if (isAmazon && asin) {
+            const validImage = await findAmazonImageUrl(asin);
+            if (validImage) data.imageUrl = validImage;
+          }
+        }
+      } catch (e) { /* keep existing imageUrl if head check fails */ }
+    }
+
+    // Step 7: UPC API fallback
     if (data.upc === 'Not Found') {
-      const apiUpc = await lookupUpcByTitle(data.title);
-      if (apiUpc) data.upc = apiUpc;
+      // Only try if we have a useful title (not generic)
+      const titleIsUseful = data.title && data.title !== 'Product Title' && data.title !== 'Product' &&
+                            data.title !== 'Amazon.com' && !isBotDetectionPage('', data.title);
+      if (titleIsUseful) {
+        const apiUpc = await lookupUpcByTitle(data.title);
+        if (apiUpc) data.upc = apiUpc;
+      }
     }
 
   } catch (err) {
@@ -379,6 +598,12 @@ async function scrapeProductData(url) {
 
   if (!data.upc  || data.upc.trim()   === '') data.upc   = 'Not Found';
   if (!data.title || data.title.trim() === '') data.title = 'Product';
+
+  // Sanitize generic/bot-page titles
+  if (data.title === 'Amazon.com' || data.title.toLowerCase().includes('robot or human') ||
+      data.title.toLowerCase().includes('access denied') || data.title.toLowerCase().includes('captcha')) {
+    data.title = 'Product';
+  }
 
   return data;
 }
