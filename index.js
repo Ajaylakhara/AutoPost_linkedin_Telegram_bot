@@ -111,6 +111,73 @@ const checkAuth = (req, res, next) => {
 
 
 // ── Express Endpoints ──────────────────────────────────────────────────────────
+
+// 0. Root Dashboard — fixes "Cannot GET /" shown in browser
+app.get('/', (req, res) => {
+  const uptime = Math.floor(process.uptime());
+  const hours  = Math.floor(uptime / 3600);
+  const mins   = Math.floor((uptime % 3600) / 60);
+  const secs   = uptime % 60;
+  const uptimeStr = `${hours}h ${mins}m ${secs}s`;
+  const mode = isProduction ? '🌐 Webhook (Render)' : '💻 Polling (Local Dev)';
+  const recentLogs = logBuffer.slice(-8).reverse();
+
+  const logRows = recentLogs.map(l => {
+    const color = l.type === 'error' ? '#ff6b6b' : l.type === 'warning' ? '#ffd93d' : l.type === 'success' ? '#6bcb77' : '#adb5bd';
+    const time  = new Date(l.timestamp).toLocaleTimeString();
+    return `<tr><td style="color:${color};padding:4px 8px;white-space:nowrap">${l.type.toUpperCase()}</td><td style="padding:4px 8px;color:#ccc;white-space:nowrap">${time}</td><td style="padding:4px 12px;color:#e0e0e0">${l.message}</td></tr>`;
+  }).join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>AutoPost Bot — Status</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0f0f14;color:#e0e0e0;font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:40px 16px}
+    h1{font-size:2rem;font-weight:700;color:#fff;margin-bottom:4px}
+    .sub{color:#888;font-size:.9rem;margin-bottom:32px}
+    .cards{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;margin-bottom:32px}
+    .card{background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;padding:20px 28px;min-width:160px;text-align:center}
+    .card .val{font-size:1.8rem;font-weight:700;color:#6bcb77}
+    .card .val.warn{color:#ffd93d}
+    .card .val.info{color:#74b9ff}
+    .card .lbl{font-size:.78rem;color:#888;margin-top:4px;text-transform:uppercase;letter-spacing:.05em}
+    .badge{display:inline-block;background:#6bcb7722;color:#6bcb77;border:1px solid #6bcb7755;border-radius:20px;padding:4px 14px;font-size:.85rem;font-weight:600;margin-bottom:24px}
+    table{border-collapse:collapse;width:100%;max-width:760px;background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;overflow:hidden}
+    th{background:#22223a;padding:8px 12px;text-align:left;font-size:.75rem;color:#888;text-transform:uppercase;letter-spacing:.06em}
+    td{border-top:1px solid #2a2a3a;font-size:.83rem}
+    h2{color:#aaa;font-size:1rem;margin-bottom:12px;text-transform:uppercase;letter-spacing:.08em}
+  </style>
+</head>
+<body>
+  <h1>🤖 AutoPost Bot</h1>
+  <p class="sub">Telegram Deal Formatter — Closeout Products</p>
+  <span class="badge">● ONLINE</span>
+  <div class="cards">
+    <div class="card"><div class="val info">${uptimeStr}</div><div class="lbl">Uptime</div></div>
+    <div class="card"><div class="val">${metrics.totalProcessed}</div><div class="lbl">Messages Processed</div></div>
+    <div class="card"><div class="val">${metrics.successfulScrapes}</div><div class="lbl">Successful Scrapes</div></div>
+    <div class="card"><div class="val warn">${metrics.failedScrapes}</div><div class="lbl">Failed Scrapes</div></div>
+  </div>
+  <p style="color:#666;font-size:.8rem;margin-bottom:20px">Mode: ${mode} &nbsp;|&nbsp; Auto-refreshes every 30s</p>
+  <h2>Recent Activity</h2>
+  <table>
+    <thead><tr><th>Type</th><th>Time</th><th>Message</th></tr></thead>
+    <tbody>${logRows || '<tr><td colspan="3" style="text-align:center;padding:16px;color:#555">No logs yet</td></tr>'}</tbody>
+  </table>
+</body>
+</html>`);
+});
+
+// 0b. Health check endpoint (used by keep-alive ping)
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: Math.floor(process.uptime()), mode: isProduction ? 'webhook' : 'polling' });
+});
+
 app.post('/telegram-webhook', (req, res) => {
   try {
     bot.processUpdate(req.body);
@@ -367,11 +434,13 @@ bot.on('message', async (msg) => {
 });
 
 // ── Keep-alive ping (prevents Render free tier from sleeping) ──────────────────
+// Ping every 4 minutes — well within Render's 15-minute inactivity sleep window
 if (isProduction && process.env.RENDER_EXTERNAL_URL) {
-  const pingUrl = process.env.RENDER_EXTERNAL_URL;
+  const pingUrl = `${process.env.RENDER_EXTERNAL_URL}/health`;
   setInterval(() => {
     https.get(pingUrl).on('error', (err) => {
       addLog('warning', `Keep-alive ping error: ${err.message}`);
     });
-  }, 600000); // every 10 minutes
+  }, 240000); // every 4 minutes
+  addLog('info', `Keep-alive ping scheduled every 4 minutes → ${pingUrl}`);
 }
