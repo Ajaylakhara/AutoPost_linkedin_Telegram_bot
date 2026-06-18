@@ -57,14 +57,45 @@ function extractAsin(url) {
 function buildAmazonImageCandidates(asin) {
   if (!asin) return [];
   return [
-    // Reliable media-amazon.com CDN patterns
-    `https://m.media-amazon.com/images/P/${asin}.01._SX400_.jpg`,
+    // Reliable media-amazon.com CDN patterns - Try high-res first
     `https://m.media-amazon.com/images/P/${asin}.01.LZZZZZZZ.jpg`,
-    `https://m.media-amazon.com/images/P/${asin}.01._SL400_.jpg`,
+    `https://m.media-amazon.com/images/P/${asin}.01._SL1000_.jpg`,
+    `https://m.media-amazon.com/images/P/${asin}.01._SX1000_.jpg`,
+    `https://m.media-amazon.com/images/P/${asin}.01._SX600_.jpg`,
+    `https://m.media-amazon.com/images/P/${asin}.01._SX400_.jpg`,
     // Legacy ssl-images CDN (often returns GIF placeholder — validated below)
     `https://images-na.ssl-images-amazon.com/images/P/${asin}.01.LZZZZZZZ.jpg`,
     `https://images-na.ssl-images-amazon.com/images/P/${asin}.01._SCLZZZZZZZ_.jpg`,
   ];
+}
+
+// ── Convert image URL to highest resolution possible ──────────────────────────
+function getHighResImageUrl(imageUrl, productUrl) {
+  if (!imageUrl || typeof imageUrl !== 'string') return imageUrl;
+
+  const isAmz = (productUrl && productUrl.includes('amazon.com')) || imageUrl.includes('media-amazon.com') || imageUrl.includes('images-amazon.com');
+  const isWm = (productUrl && productUrl.includes('walmart.com')) || imageUrl.includes('walmartimages.com');
+  const isEb = (productUrl && productUrl.includes('ebay.com')) || imageUrl.includes('ebayimg.com');
+
+  if (isAmz) {
+    // Strip dynamic resizing parameters (e.g. ._AC_US40_ or ._SX300_)
+    return imageUrl.replace(/\._[A-Z0-9_,-]+\.(jpe?g|png|webp|gif)$/i, '.$1');
+  }
+
+  if (isWm) {
+    // Replace odnHeight/odnWidth query params with larger ones
+    let cleaned = imageUrl;
+    cleaned = cleaned.replace(/odnHeight=\d+/gi, 'odnHeight=1000');
+    cleaned = cleaned.replace(/odnWidth=\d+/gi, 'odnWidth=1000');
+    return cleaned;
+  }
+
+  if (isEb) {
+    // eBay image URL format has size like s-l64.jpg, change it to s-l1600.jpg
+    return imageUrl.replace(/s-l\d+\.(jpe?g|png|webp|gif)$/i, 's-l1600.$1');
+  }
+
+  return imageUrl;
 }
 
 // ── Check if an image URL is valid (not a GIF placeholder, not too small) ─────
@@ -100,7 +131,7 @@ async function expandUrl(url, maxRedirects = 8) {
     const response = await axios.get(url, {
       maxRedirects: 0,
       validateStatus: (status) => status >= 200 && status < 400,
-      timeout: 8000,
+      timeout: 4000,
       headers: { 'User-Agent': getRandomUserAgent() }
     });
 
@@ -170,10 +201,87 @@ async function lookupUpcByTitle(title) {
   return null;
 }
 
+// ── UPCitemdb Page Scraper fallback for ASINs ─────────────────────────────────
+async function lookupUpcByAsin(asin) {
+  if (!asin) return null;
+  try {
+    const response = await axios.get(`https://www.upcitemdb.com/query?s=${asin}&type=2`, {
+      timeout: 5000,
+      headers: {
+        'User-Agent': getRandomUserAgent(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.google.com/'
+      }
+    });
+
+    const $ = cheerio.load(response.data);
+    let foundUpc = null;
+    $('a').each((_, el) => {
+      const href = $(el).attr('href') || '';
+      const match = href.match(/\/upc\/(\d{12,13})/);
+      if (match) {
+        foundUpc = match[1];
+        return false; // break
+      }
+    });
+
+    if (foundUpc) {
+      console.log(`[Scraper] Scraped UPC ${foundUpc} from UPCitemdb query for ASIN: ${asin}`);
+      return foundUpc;
+    }
+  } catch (err) {
+    console.error(`[Scraper] UPCitemdb query scrape failed for ASIN ${asin}: ${err.message}`);
+  }
+  return null;
+}
+
+// ── Scrape eBay product page ──────────────────────────────────────────────────
+async function scrapeEbay(expandedUrl) {
+  const response = await axios.get(expandedUrl, {
+    timeout: 6000,
+    maxRedirects: 5,
+    headers: {
+      'User-Agent': getRandomUserAgent(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'max-age=0',
+      'Connection': 'keep-alive',
+      'Referer': 'https://www.google.com/',
+      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-user': '?1',
+      'upgrade-insecure-requests': '1',
+      'dnt': '1'
+    }
+  });
+  return response.data;
+}
+
+// ── Scrape eBay mobile page (fallback when desktop is blocked) ────────────────
+async function scrapeEbayMobile(expandedUrl) {
+  const response = await axios.get(expandedUrl, {
+    timeout: 6000,
+    maxRedirects: 5,
+    headers: {
+      'User-Agent': getRandomMobileUserAgent(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Connection': 'keep-alive'
+    }
+  });
+  return response.data;
+}
+
 // ── Scrape Amazon product page ─────────────────────────────────────────────────
 async function scrapeAmazon(expandedUrl) {
   const response = await axios.get(expandedUrl, {
-    timeout: 15000,
+    timeout: 6000,
     maxRedirects: 5,
     headers: {
       'User-Agent': getRandomUserAgent(),
@@ -200,7 +308,7 @@ async function scrapeAmazon(expandedUrl) {
 // ── Scrape Walmart product page (desktop) ─────────────────────────────────────
 async function scrapeWalmartDesktop(expandedUrl) {
   const response = await axios.get(expandedUrl, {
-    timeout: 15000,
+    timeout: 6000,
     maxRedirects: 5,
     headers: {
       'User-Agent': getRandomUserAgent(),
@@ -230,7 +338,7 @@ async function scrapeWalmartDesktop(expandedUrl) {
 async function scrapeWalmartMobile(expandedUrl) {
   // Use www.walmart.com with a mobile user-agent (mobile.walmart.com doesn't exist)
   const response = await axios.get(expandedUrl, {
-    timeout: 15000,
+    timeout: 6000,
     maxRedirects: 5,
     headers: {
       'User-Agent': getRandomMobileUserAgent(),
@@ -255,7 +363,7 @@ async function scrapeAmazonMobile(expandedUrl, asin) {
     : expandedUrl;
 
   const response = await axios.get(mobileUrl, {
-    timeout: 15000,
+    timeout: 6000,
     maxRedirects: 5,
     headers: {
       'User-Agent': getRandomMobileUserAgent(),
@@ -354,6 +462,10 @@ function parseHtml(html, expandedUrl, data) {
         const upcRx = rawHtml.match(/"upc"\s*:\s*"([^"]{8,14})"/);
         if (upcRx) data.upc = upcRx[1];
       }
+      if (data.upc === 'Not Found') {
+        const gtinRx = rawHtml.match(/"gtin"\s*:\s*"([^"]{8,14})"/);
+        if (gtinRx) data.upc = gtinRx[1];
+      }
       if (!data.imageUrl) {
         const thumbRx = rawHtml.match(/"thumbnailUrl"\s*:\s*"(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)"/i);
         if (thumbRx) data.imageUrl = thumbRx[1].split('\\\\').join('/');
@@ -371,6 +483,58 @@ function parseHtml(html, expandedUrl, data) {
       if (data.upc === 'Not Found' || !data.imageUrl) {
         const upcRx2 = rawHtml.match(/"upc\\?"\\s*:\\s*\\"([^"\\\\]{8,14})\\"/);
         if (upcRx2 && data.upc === 'Not Found') data.upc = upcRx2[1];
+      }
+      if (data.upc === 'Not Found') {
+        const gtinRx2 = rawHtml.match(/"gtin\\?"\\s*:\\s*\\"([^"\\\\]{8,14})\\"/);
+        if (gtinRx2) data.upc = gtinRx2[1];
+      }
+    }
+  }
+
+  // 2b. eBay data extraction
+  if (expandedUrl.includes('ebay.com')) {
+    if (data.title === 'Product Title') {
+      const ebayTitle = $('.x-item-title__mainTitle').text().trim() || $('#itemTitle').text().trim();
+      if (ebayTitle) {
+        data.title = ebayTitle.replace(/^Details about\s+/i, '').replace(/\s*\| eBay\s*$/i, '').trim();
+      }
+    }
+
+    if (!data.imageUrl) {
+      const ebayImg = $('#icImg').attr('src') ||
+                      $('.ux-image-filmstrip-carousel-item img').attr('src') ||
+                      $('.ux-image-carousel-item img').attr('src');
+      if (ebayImg) data.imageUrl = ebayImg;
+    }
+
+    if (data.upc === 'Not Found') {
+      let ebayUpc = '';
+      $('.ux-labels-values__labels-content').each((_, el) => {
+        const labelText = $(el).text().trim().toLowerCase();
+        if (labelText === 'upc' || labelText.includes('upc:')) {
+          const valEl = $(el).closest('.ux-labels-values__labels').next('.ux-labels-values__values');
+          const valText = valEl.find('.ux-labels-values__values-content').text().trim() || valEl.text().trim();
+          if (valText && !valText.toLowerCase().includes('does not apply')) {
+            ebayUpc = valText.replace(/\D/g, '');
+          }
+        }
+      });
+
+      if (!ebayUpc) {
+        $('.attrLabels').each((_, el) => {
+          const labelText = $(el).text().trim().toLowerCase();
+          if (labelText === 'upc' || labelText.includes('upc')) {
+            const valEl = $(el).next('td');
+            const valText = valEl.find('span').text().trim() || valEl.text().trim();
+            if (valText && !valText.toLowerCase().includes('does not apply')) {
+              ebayUpc = valText.replace(/\D/g, '');
+            }
+          }
+        });
+      }
+
+      if (ebayUpc) {
+        data.upc = ebayUpc;
       }
     }
   }
@@ -403,8 +567,22 @@ function parseHtml(html, expandedUrl, data) {
     if (amzImgDynamic) {
       try {
         const decoded = JSON.parse(amzImgDynamic);
-        const urls = Object.keys(decoded);
-        if (urls.length > 0) data.imageUrl = urls[0];
+        let maxArea = 0;
+        let bestUrl = null;
+        for (const [url, dims] of Object.entries(decoded)) {
+          if (Array.isArray(dims) && dims.length >= 2) {
+            const area = dims[0] * dims[1];
+            if (area > maxArea) {
+              maxArea = area;
+              bestUrl = url;
+            }
+          }
+        }
+        if (bestUrl) data.imageUrl = bestUrl;
+        else {
+          const urls = Object.keys(decoded);
+          if (urls.length > 0) data.imageUrl = urls[0];
+        }
       } catch (e) {}
     }
 
@@ -436,6 +614,11 @@ function parseHtml(html, expandedUrl, data) {
   } else if (data.imageUrl && data.imageUrl.startsWith('/')) {
     const parsedUrl = urlModule.parse(expandedUrl);
     data.imageUrl = `${parsedUrl.protocol}//${parsedUrl.host}${data.imageUrl}`;
+  }
+
+  // Convert to high-resolution URL
+  if (data.imageUrl) {
+    data.imageUrl = getHighResImageUrl(data.imageUrl, expandedUrl);
   }
 
   // 5. UPC fallback from HTML text
@@ -480,6 +663,7 @@ async function scrapeProductData(url) {
     const expandedUrl = await expandUrl(url);
     const isAmazon  = expandedUrl.includes('amazon.com');
     const isWalmart = expandedUrl.includes('walmart.com');
+    const isEbay    = expandedUrl.includes('ebay.com');
 
     // Step 1: Extract ASIN (Amazon) or Item ID (Walmart)
     let asin = null;
@@ -500,6 +684,19 @@ async function scrapeProductData(url) {
           html = await scrapeWalmartDesktop(expandedUrl);
         } catch (desktopErr) {
           console.error(`[Scraper] Walmart desktop failed: ${desktopErr.message}, trying mobile...`);
+        }
+      } else if (isEbay) {
+        try {
+          html = await scrapeEbay(expandedUrl);
+        } catch (desktopErr) {
+          console.error(`[Scraper] eBay desktop failed: ${desktopErr.message}, trying mobile...`);
+        }
+        if (!html) {
+          try {
+            html = await scrapeEbayMobile(expandedUrl);
+          } catch (mobileErr) {
+            console.error(`[Scraper] eBay mobile fallback failed: ${mobileErr.message}`);
+          }
         }
       } else {
         const response = await axios.get(expandedUrl, {
@@ -583,12 +780,20 @@ async function scrapeProductData(url) {
 
     // Step 7: UPC API fallback
     if (data.upc === 'Not Found') {
-      // Only try if we have a useful title (not generic)
-      const titleIsUseful = data.title && data.title !== 'Product Title' && data.title !== 'Product' &&
-                            data.title !== 'Amazon.com' && !isBotDetectionPage('', data.title);
-      if (titleIsUseful) {
-        const apiUpc = await lookupUpcByTitle(data.title);
-        if (apiUpc) data.upc = apiUpc;
+      // 7a. Try looking up by ASIN on UPCitemdb query page (for Amazon products)
+      if (isAmazon && asin) {
+        const asinUpc = await lookupUpcByAsin(asin);
+        if (asinUpc) data.upc = asinUpc;
+      }
+
+      // 7b. Try looking up by title via free trial API
+      if (data.upc === 'Not Found') {
+        const titleIsUseful = data.title && data.title !== 'Product Title' && data.title !== 'Product' &&
+                              data.title !== 'Amazon.com' && !isBotDetectionPage('', data.title);
+        if (titleIsUseful) {
+          const apiUpc = await lookupUpcByTitle(data.title);
+          if (apiUpc) data.upc = apiUpc;
+        }
       }
     }
 

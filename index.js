@@ -90,6 +90,11 @@ if (isProduction) {
 } else {
   bot = new TelegramBot(BOT_TOKEN, { polling: true });
   addLog('info', 'Bot started in Polling mode (Local dev)');
+
+  // Gracefully handle polling connection errors (e.g. network timeouts, blocked ISP connections)
+  bot.on('polling_error', (error) => {
+    addLog('warning', `Telegram connection warning (polling failed): ${error.message}`);
+  });
 }
 
 // ── Security Middleware ────────────────────────────────────────────────────────
@@ -362,7 +367,7 @@ bot.on('message', async (msg) => {
       try {
         await bot.sendMessage(
           msg.chat.id,
-          '⚠️ No product links found. Please include an Amazon or Walmart URL.',
+          '⚠️ No product links found. Please include an Amazon, Walmart, or eBay URL.',
           { reply_to_message_id: msg.message_id }
         );
       } catch (tgErr) {
