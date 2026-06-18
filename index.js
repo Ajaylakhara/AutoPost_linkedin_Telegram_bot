@@ -391,13 +391,14 @@ bot.on('message', async (msg) => {
         addLog('success', `Scrape successful for "${scraped.title.substring(0, 40)}..."`);
       }
 
-      const formattedTelegramPost =
-        `UPC: ${scraped.upc}\n` +
-        `Price: ${product.price}\n` +
-        `Units: ${formatUnits(product.units)}\n` +
-        `FOB: ${product.fob}\n` +
-        `Exp: ${product.exp}\n` +
-        `Link: ${product.link}`;
+      const postLines = [];
+      if (scraped.upc && scraped.upc !== 'Not Found') postLines.push(`UPC: ${scraped.upc}`);
+      if (product.price)                              postLines.push(`Price: ${product.price}`);
+      if (product.units)                              postLines.push(`Units: ${formatUnits(product.units)}`);
+      if (product.fob)                                postLines.push(`FOB: ${product.fob}`);
+      if (product.exp && product.exp !== 'N/A')       postLines.push(`Exp: ${product.exp}`);
+      postLines.push(`Link: ${product.link}`);
+      const formattedTelegramPost = postLines.join('\n');
 
       const telegramOptions = { reply_to_message_id: msg.message_id };
 
