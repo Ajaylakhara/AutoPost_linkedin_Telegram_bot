@@ -388,6 +388,32 @@ function extractWalmartItemId(url) {
   return match ? match[1] : null;
 }
 
+// ── Build Walmart CDN image URL candidates from item ID ───────────────────────
+// Walmart images are served from i5.walmartimages.com using the item ID.
+// These are best-effort guesses but often work for common products.
+function buildWalmartImageCandidates(itemId) {
+  if (!itemId) return [];
+  return [
+    `https://i5.walmartimages.com/asr/${itemId}.jpeg`,
+    `https://i5.walmartimages.com/asr/${itemId}.jpg`,
+    `https://i5.walmartimages.com/seo/${itemId}.jpeg`,
+    `https://i5.walmartimages.com/seo/${itemId}.jpg`,
+  ];
+}
+
+// ── Find first valid Walmart CDN image URL for an item ID ─────────────────────
+async function findWalmartImageUrl(itemId) {
+  const candidates = buildWalmartImageCandidates(itemId);
+  for (const url of candidates) {
+    const valid = await validateImageUrl(url);
+    if (valid) {
+      console.log(`[Scraper] Found valid Walmart CDN image for item ${itemId}: ${url}`);
+      return url;
+    }
+  }
+  return null;
+}
+
 
 // ── Parse HTML for product fields ─────────────────────────────────────────────
 function parseHtml(html, expandedUrl, data) {
@@ -443,14 +469,45 @@ function parseHtml(html, expandedUrl, data) {
           if (jsonMatch) jsonStr = jsonMatch[1];
         }
         const nextData = JSON.parse(jsonStr);
-        const product = nextData && nextData.props && nextData.props.pageProps &&
-                        nextData.props.pageProps.initialData && nextData.props.pageProps.initialData.data &&
-                        nextData.props.pageProps.initialData.data.product;
+
+        // Try multiple product paths (Walmart has changed their data layout)
+        const initialData = nextData?.props?.pageProps?.initialData?.data;
+        const product = initialData?.product ||
+                        initialData?.idmlMap?.primaryProduct ||
+                        initialData?.primaryProduct;
+
         if (product) {
           if (data.title === 'Product Title' && product.name) data.title = product.name;
-          if (!data.imageUrl && product.imageInfo && product.imageInfo.thumbnailUrl) data.imageUrl = product.imageInfo.thumbnailUrl;
-          if (!data.imageUrl && product.imageInfo && product.imageInfo.allImages && product.imageInfo.allImages[0]) data.imageUrl = product.imageInfo.allImages[0].url || product.imageInfo.allImages[0];
+
+          // Extract image — try all known Walmart image schema paths
+          if (!data.imageUrl) {
+            const imgInfo = product.imageInfo || product.primaryImageInfo || {};
+            data.imageUrl =
+              imgInfo.thumbnailUrl ||
+              imgInfo.url ||
+              (Array.isArray(imgInfo.allImages) && imgInfo.allImages[0] && (imgInfo.allImages[0].url || imgInfo.allImages[0])) ||
+              (Array.isArray(product.images) && product.images[0] && (product.images[0].url || product.images[0])) ||
+              null;
+          }
+
           if (data.upc === 'Not Found' && product.upc) data.upc = product.upc;
+          if (data.upc === 'Not Found' && product.gtin) data.upc = product.gtin.replace(/\D/g, '');
+        }
+
+        // Also check top-level contentLayout items (newer Walmart SPA structure)
+        if (!data.imageUrl) {
+          const modules = nextData?.props?.pageProps?.initialData?.data?.contentLayout?.modules;
+          if (Array.isArray(modules)) {
+            for (const mod of modules) {
+              const imgUrl = mod?.configs?.primaryImage?.url ||
+                             mod?.configs?.image?.url ||
+                             mod?.configs?.hero?.image?.url;
+              if (imgUrl && typeof imgUrl === 'string') {
+                data.imageUrl = imgUrl;
+                break;
+              }
+            }
+          }
         }
       } catch (e) { /* skip malformed Next.js data */ }
     }
@@ -679,11 +736,20 @@ async function scrapeProductData(url) {
       if (isAmazon) {
         html = await scrapeAmazon(expandedUrl);
       } else if (isWalmart) {
-        // Try desktop first
+        // Try desktop first, then immediately fall back to mobile on any failure
         try {
           html = await scrapeWalmartDesktop(expandedUrl);
         } catch (desktopErr) {
           console.error(`[Scraper] Walmart desktop failed: ${desktopErr.message}, trying mobile...`);
+        }
+        // If desktop failed or returned empty, try mobile right away
+        if (!html) {
+          try {
+            html = await scrapeWalmartMobile(expandedUrl);
+            console.log(`[Scraper] Walmart mobile fallback succeeded for: ${expandedUrl}`);
+          } catch (mobileErr) {
+            console.error(`[Scraper] Walmart mobile fallback also failed: ${mobileErr.message}`);
+          }
         }
       } else if (isEbay) {
         try {
@@ -749,7 +815,7 @@ async function scrapeProductData(url) {
       }
     }
 
-    // Step 5: Amazon ASIN-based image fallback
+    // Step 5a: Amazon ASIN-based image fallback
     // Only run if no image found, or if image is a suspicious short URL
     if (isAmazon && asin && !data.imageUrl) {
       console.log(`[Scraper] Trying Amazon CDN image candidates for ASIN: ${asin}`);
@@ -757,6 +823,15 @@ async function scrapeProductData(url) {
       if (validImage) {
         data.imageUrl = validImage;
         console.log(`[Scraper] Found valid Amazon CDN image: ${validImage}`);
+      }
+    }
+
+    // Step 5b: Walmart item-ID-based image CDN fallback
+    if (isWalmart && walmartItemId && !data.imageUrl) {
+      console.log(`[Scraper] Trying Walmart CDN image candidates for item ID: ${walmartItemId}`);
+      const validWalmartImage = await findWalmartImageUrl(walmartItemId);
+      if (validWalmartImage) {
+        data.imageUrl = validWalmartImage;
       }
     }
 
@@ -769,10 +844,13 @@ async function scrapeProductData(url) {
         if (contentType.includes('gif') || (contentLength > 0 && contentLength < 2000)) {
           console.log(`[Scraper] Rejected placeholder image (${contentType}, ${contentLength}B): ${data.imageUrl}`);
           data.imageUrl = '';
-          // Try ASIN CDN as backup for Amazon
+          // Try CDN fallbacks per platform
           if (isAmazon && asin) {
             const validImage = await findAmazonImageUrl(asin);
             if (validImage) data.imageUrl = validImage;
+          } else if (isWalmart && walmartItemId) {
+            const validWalmartImage = await findWalmartImageUrl(walmartItemId);
+            if (validWalmartImage) data.imageUrl = validWalmartImage;
           }
         }
       } catch (e) { /* keep existing imageUrl if head check fails */ }
