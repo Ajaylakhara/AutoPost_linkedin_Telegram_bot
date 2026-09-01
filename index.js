@@ -415,11 +415,11 @@ bot.on('message', async (msg) => {
       }
 
       const postLines = [];
-      if (scraped.upc && scraped.upc !== 'Not Found') postLines.push(`UPC: ${scraped.upc}`);
-      if (product.price)                              postLines.push(`Price: ${product.price}`);
-      if (product.units)                              postLines.push(`Units: ${formatUnits(product.units)}`);
-      if (product.fob)                                postLines.push(`FOB: ${product.fob}`);
-      if (product.exp && product.exp !== 'N/A')       postLines.push(`Exp: ${product.exp}`);
+      if (scraped.upc && scraped.upc !== 'Not Found')                     postLines.push(`UPC: ${scraped.upc}`);
+      if (product.price && product.price !== 'N/A')                       postLines.push(`Price: ${product.price}`);
+      if (product.units && product.units !== 'N/A')                       postLines.push(`Units: ${formatUnits(product.units)}`);
+      if (product.fob && product.fob !== 'N/A' && product.fob !== 'null') postLines.push(`FOB: ${product.fob}`);
+      if (product.exp && product.exp !== 'N/A' && product.exp !== 'null') postLines.push(`Exp: ${product.exp}`);
       postLines.push(`Link: ${product.link}`);
       const formattedTelegramPost = postLines.join('\n');
 

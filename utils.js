@@ -161,10 +161,10 @@ function parseMessage(text) {
     const blockText  = normalizedText.substring(blockStart, blockEnd);
 
     // Extract from block first, fall back to global if not found
-    const price = extractPrice(blockText) || globalPrice || 'Contact for Price';
-    const units = extractUnits(blockText) || globalUnits || 'N/A';
-    const fob   = extractFob(blockText)   || globalFob   || 'N/A';
-    const exp   = extractExp(blockText)   || globalExp   || 'N/A';
+    const price = extractPrice(blockText) || globalPrice || null;
+    const units = extractUnits(blockText) || globalUnits || null;
+    const fob   = extractFob(blockText)   || globalFob   || null;
+    const exp   = extractExp(blockText)   || globalExp   || null;
 
     products.push({ link, price, units, fob, exp });
   }
