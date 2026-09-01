@@ -18,6 +18,7 @@ const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
 const { parseMessage } = require('./utils');
 const { scrapeProductData } = require('./scraper');
 
@@ -343,6 +344,28 @@ function formatUnits(units) {
   return num.toLocaleString('en-US');
 }
 
+// ── Helper: Download image buffer to bypass Telegram CDN crawler blocks ────────
+async function downloadImageBuffer(imageUrl) {
+  if (!imageUrl || typeof imageUrl !== 'string') return null;
+  try {
+    const response = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      timeout: 8000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Referer': 'https://www.google.com/'
+      }
+    });
+    if (response.status === 200 && response.data && response.data.byteLength > 1000) {
+      return Buffer.from(response.data);
+    }
+  } catch (err) {
+    addLog('warning', `Image buffer download warning for ${imageUrl.substring(0, 40)}...: ${err.message}`);
+  }
+  return null;
+}
+
 // ── Main Message Listener ──────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   try {
@@ -402,25 +425,40 @@ bot.on('message', async (msg) => {
 
       const telegramOptions = { reply_to_message_id: msg.message_id };
 
-      // 3. Send with image if available, fallback to text
-      try {
-        if (scraped.imageUrl) {
-          await bot.sendPhoto(msg.chat.id, scraped.imageUrl, {
-            caption: formattedTelegramPost,
-            ...telegramOptions
-          });
-          addLog('success', `Sent photo deal card to Telegram successfully`);
-        } else {
-          await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
-          addLog('success', `Sent text-only deal card to Telegram successfully`);
+      // 3. Send with image if available (using buffer upload to prevent crawler blocks)
+      let photoSent = false;
+      if (scraped.imageUrl) {
+        try {
+          const imgBuffer = await downloadImageBuffer(scraped.imageUrl);
+          if (imgBuffer) {
+            await bot.sendPhoto(msg.chat.id, imgBuffer, {
+              caption: formattedTelegramPost,
+              ...telegramOptions
+            }, {
+              filename: 'product.jpg',
+              contentType: 'image/jpeg'
+            });
+            photoSent = true;
+            addLog('success', `Sent photo deal card (via buffer) to Telegram successfully`);
+          } else {
+            await bot.sendPhoto(msg.chat.id, scraped.imageUrl, {
+              caption: formattedTelegramPost,
+              ...telegramOptions
+            });
+            photoSent = true;
+            addLog('success', `Sent photo deal card (via URL) to Telegram successfully`);
+          }
+        } catch (photoErr) {
+          addLog('warning', `Photo deal send failed (${photoErr.message}), falling back to text`);
         }
-      } catch (tgErr) {
-        addLog('warning', `Photo deal send failed, retrying text fallback: ${tgErr.message}`);
+      }
+
+      if (!photoSent) {
         try {
           await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
-          addLog('success', `Sent fallback text-only deal card to Telegram successfully`);
-        } catch (fbErr) {
-          addLog('error', `Text fallback failed completely: ${fbErr.message}`);
+          addLog('success', `Sent text-only deal card to Telegram successfully`);
+        } catch (textErr) {
+          addLog('error', `Text send failed: ${textErr.message}`);
         }
       }
     }
@@ -439,14 +477,26 @@ bot.on('message', async (msg) => {
   }
 });
 
-// ── Keep-alive ping (prevents Render free tier from sleeping) ──────────────────
-// Ping every 4 minutes — well within Render's 15-minute inactivity sleep window
+// ── Keep-alive ping & Webhook auto-maintenance ─────────────────────────────────
+// Ping every 4 minutes — keeps Render awake and ensures webhook stays active
 if (isProduction && process.env.RENDER_EXTERNAL_URL) {
   const pingUrl = `${process.env.RENDER_EXTERNAL_URL}/health`;
-  setInterval(() => {
+  setInterval(async () => {
     https.get(pingUrl).on('error', (err) => {
       addLog('warning', `Keep-alive ping error: ${err.message}`);
     });
+
+    // Auto-verify webhook is registered with Telegram
+    try {
+      const webhookInfo = await bot.getWebHookInfo();
+      const expectedWebhookUrl = `${process.env.RENDER_EXTERNAL_URL}/telegram-webhook`;
+      if (!webhookInfo.url || webhookInfo.url !== expectedWebhookUrl) {
+        addLog('warning', `Telegram webhook was missing/unsynced. Auto-registering: ${expectedWebhookUrl}`);
+        await bot.setWebHook(expectedWebhookUrl);
+      }
+    } catch (err) {
+      addLog('warning', `Webhook auto-maintenance check failed: ${err.message}`);
+    }
   }, 240000); // every 4 minutes
-  addLog('info', `Keep-alive ping scheduled every 4 minutes → ${pingUrl}`);
+  addLog('info', `Keep-alive & webhook health checker scheduled every 4 minutes → ${pingUrl}`);
 }
