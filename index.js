@@ -85,9 +85,27 @@ addLog('info', 'Initializing Telegram bot...');
 if (isProduction) {
   bot = new TelegramBot(BOT_TOKEN, { polling: false });
   const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/telegram-webhook`;
-  bot.setWebHook(webhookUrl)
-    .then(() => addLog('success', `Webhook registered successfully at: ${webhookUrl}`))
-    .catch(err => addLog('error', `Webhook setup failed: ${err.message}`));
+  
+  async function syncWebhook(url, retries = 5, delay = 2500) {
+    try {
+      const info = await bot.getWebHookInfo();
+      if (info.url === url) {
+        addLog('success', `Webhook is active and synced at: ${url}`);
+        return;
+      }
+      await bot.setWebHook(url);
+      addLog('success', `Webhook registered successfully at: ${url}`);
+    } catch (err) {
+      if (retries > 0 && err.message.includes('429')) {
+        addLog('warning', `Telegram rate limited (429). Retrying webhook sync in ${delay / 1000}s...`);
+        setTimeout(() => syncWebhook(url, retries - 1, delay * 2), delay);
+      } else {
+        addLog('error', `Webhook setup failed: ${err.message}`);
+      }
+    }
+  }
+
+  syncWebhook(webhookUrl);
 } else {
   bot = new TelegramBot(BOT_TOKEN, { polling: true });
   addLog('info', 'Bot started in Polling mode (Local dev)');
