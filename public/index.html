@@ -335,28 +335,16 @@
   </div>
 
   <script>
-    // =========================================================================
-    // 🔧 BACKEND API CONFIGURATION
-    // -------------------------------------------------------------------------
-    // Set your production backend URL here if you want it pre-filled automatically
-    // Example: const DEFAULT_PRODUCTION_BACKEND_URL = 'https://your-bot.onrender.com';
-    // Otherwise, you can type it into the "Backend API URL" input bar on the page.
-    // =========================================================================
-    const DEFAULT_PRODUCTION_BACKEND_URL = '';
+    // Automatically connects to the current Firebase domain (or localhost during local dev)
+    const DEFAULT_API = localStorage.getItem('backend_api_url') || window.location.origin;
 
-    const DEFAULT_API = DEFAULT_PRODUCTION_BACKEND_URL || (
-      window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-        ? 'http://localhost:3000'
-        : (localStorage.getItem('backend_api_url') || '')
-    );
-
-    document.getElementById('apiUrl').value = localStorage.getItem('backend_api_url') || DEFAULT_API;
+    document.getElementById('apiUrl').value = DEFAULT_API;
     document.getElementById('apiKey').value = localStorage.getItem('backend_api_key') || '';
 
     function getApiUrl() {
       let url = document.getElementById('apiUrl').value.trim();
       if (url.endsWith('/')) url = url.slice(0, -1);
-      return url || DEFAULT_API;
+      return url || window.location.origin;
     }
 
     function getApiKey() {

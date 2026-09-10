@@ -1,28 +1,26 @@
 /**
- * 🤖 AutoPost Telegram Bot (Backend Server + API)
+ * 🤖 AutoPost Telegram Bot (Unified Serverless Backend + APIs)
  *
- * Flow:
- * 1. Runs an Express HTTP server (health check, status APIs, ASIN DB, Telegram Webhook/Polling).
- * 2. Connects to Telegram (Polling for local dev, Webhook in production).
- * 3. Listens for incoming product deal messages, parses deals, scrapes metadata, deduplicates, and posts to Telegram.
- * 4. Exposes REST APIs for the Firebase Hosting Dashboard.
+ * Runs as:
+ * - Firebase HTTPS Cloud Function (Production)
+ * - Express HTTP Server (Local Dev via `npm start`)
  */
 
 require('dotenv').config();
 const express = require('express');
-const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const { parseMessage, checkAndAddProductKey } = require('./utils');
+const { parseMessage } = require('./utils');
 const { scrapeProductData, extractProductKey } = require('./scraper');
+const db = require('./db');
 
 // Express App Initialization
 const app = express();
 app.use(express.json());
 
-// Enable CORS for Firebase Hosting dashboard
+// Enable CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -34,6 +32,10 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+// Environment & Deployment Detection
+const isCloudFunction = !!(process.env.FUNCTION_TARGET || process.env.K_SERVICE || process.env.FIREBASE_CONFIG);
+const isProduction = isCloudFunction || !!process.env.WEBHOOK_URL;
 
 // ── In-Memory Logging System ───────────────────────────────────────────────────
 const LOGS_MAX_SIZE = 100;
@@ -54,7 +56,6 @@ function addLog(type, message, metadata = null) {
     logBuffer.shift();
   }
 
-  // Console output
   const consoleMsg = `[${type.toUpperCase()}] ${message}`;
   if (type === 'error') {
     console.error(consoleMsg, metadata ? JSON.stringify(metadata) : '');
@@ -81,54 +82,31 @@ process.on('uncaughtException', (err) => {
 
 // ── Telegram Bot Configuration ─────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const isProduction = !!(process.env.RENDER_EXTERNAL_URL || process.env.WEBHOOK_URL);
 let bot;
 
 if (!BOT_TOKEN) {
-  addLog('error', 'BOT_TOKEN is missing in .env');
-  process.exit(1);
+  addLog('error', 'BOT_TOKEN is missing in environment variables');
 }
 
-addLog('info', 'Initializing Telegram bot...');
-if (isProduction) {
-  bot = new TelegramBot(BOT_TOKEN, { polling: false });
-  const serverUrl = process.env.RENDER_EXTERNAL_URL || process.env.WEBHOOK_URL;
-  const webhookUrl = `${serverUrl}/telegram-webhook`;
+if (BOT_TOKEN) {
+  if (isProduction) {
+    bot = new TelegramBot(BOT_TOKEN, { polling: false });
+    addLog('info', 'Telegram bot initialized in Webhook mode (Firebase Live)');
+  } else {
+    bot = new TelegramBot(BOT_TOKEN, { polling: true });
+    addLog('info', 'Telegram bot started in Polling mode (Local dev)');
 
-  async function syncWebhook(url, retries = 5, delay = 2500) {
-    try {
-      const info = await bot.getWebHookInfo();
-      if (info.url === url) {
-        addLog('success', `Webhook is active and synced at: ${url}`);
-        return;
-      }
-      await bot.setWebHook(url);
-      addLog('success', `Webhook registered successfully at: ${url}`);
-    } catch (err) {
-      if (retries > 0 && err.message.includes('429')) {
-        addLog('warning', `Telegram rate limited (429). Retrying in ${delay / 1000}s...`);
-        setTimeout(() => syncWebhook(url, retries - 1, delay * 2), delay);
-      } else {
-        addLog('error', `Webhook setup failed: ${err.message}`);
-      }
-    }
+    bot.on('polling_error', (error) => {
+      addLog('warning', `Telegram connection warning (polling): ${error.message}`);
+    });
   }
-
-  syncWebhook(webhookUrl);
-} else {
-  bot = new TelegramBot(BOT_TOKEN, { polling: true });
-  addLog('info', 'Bot started in Polling mode (Local dev)');
-
-  bot.on('polling_error', (error) => {
-    addLog('warning', `Telegram connection warning (polling failed): ${error.message}`);
-  });
 }
 
 // ── Security Middleware ────────────────────────────────────────────────────────
 const checkAuth = (req, res, next) => {
   const apiKey = process.env.DASHBOARD_API_KEY;
   if (!apiKey) {
-    return next(); // Protection disabled if DASHBOARD_API_KEY is not defined
+    return next();
   }
 
   const providedKey = req.headers['x-api-key'] || req.query.apiKey;
@@ -140,34 +118,40 @@ const checkAuth = (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized. Invalid or missing API key.' });
 };
 
-// ── Express Endpoints ──────────────────────────────────────────────────────────
+// ── Endpoints ──────────────────────────────────────────────────────────────────
 
-// 0. Root Endpoint
-app.get('/', (req, res) => {
-  res.json({
-    name: 'AutoPost Telegram Bot API Server',
-    status: 'online',
-    uptime: Math.floor(process.uptime()),
-    mode: isProduction ? 'webhook' : 'polling'
-  });
-});
-
-// 0b. Health Check Endpoint
+// 0b. Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     uptime: Math.floor(process.uptime()),
-    mode: isProduction ? 'webhook' : 'polling'
+    mode: isProduction ? 'webhook (firebase)' : 'polling (local)',
+    db: db.getDbStatus()
   });
 });
 
 // 0c. Telegram Webhook Endpoint
 app.post('/telegram-webhook', (req, res) => {
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (webhookSecret) {
+    const receivedSecret = req.headers['x-telegram-bot-api-secret-token'];
+    if (receivedSecret !== webhookSecret) {
+      addLog('warning', `Rejected webhook update: invalid secret token header from ${req.ip}`);
+      return res.status(403).send('Forbidden');
+    }
+  }
+
+  if (!bot) {
+    addLog('error', 'Webhook received but Telegram bot is not initialized');
+    return res.status(500).send('Bot not initialized');
+  }
+
   try {
     bot.processUpdate(req.body);
   } catch (err) {
     addLog('error', `Webhook process update error: ${err.message}`);
   }
+
   res.sendStatus(200);
 });
 
@@ -185,7 +169,8 @@ app.get('/api/status', checkAuth, async (req, res) => {
   const envCheck = {
     BOT_TOKEN: !!process.env.BOT_TOKEN,
     PORT: !!process.env.PORT,
-    DASHBOARD_API_KEY: !!process.env.DASHBOARD_API_KEY
+    DASHBOARD_API_KEY: !!process.env.DASHBOARD_API_KEY,
+    TELEGRAM_WEBHOOK_SECRET: !!process.env.TELEGRAM_WEBHOOK_SECRET
   };
 
   const totalScrapes = metrics.successfulScrapes + metrics.failedScrapes;
@@ -193,9 +178,10 @@ app.get('/api/status', checkAuth, async (req, res) => {
 
   res.json({
     status: 'online',
-    mode: isProduction ? 'webhook' : 'polling',
+    mode: isProduction ? 'webhook (firebase)' : 'polling (local)',
     uptime: Math.floor(process.uptime()),
     webhook: webhookInfo,
+    db: db.getDbStatus(),
     env: envCheck,
     metrics: {
       totalProcessed: metrics.totalProcessed,
@@ -212,40 +198,27 @@ app.get('/api/logs', checkAuth, (req, res) => {
 });
 
 // 3. ASIN Database Read API
-const DEDUPE_FILE = path.join(__dirname, 'crawled_asins.json');
-app.get('/api/asins', checkAuth, (req, res) => {
+app.get('/api/asins', checkAuth, async (req, res) => {
   try {
-    if (fs.existsSync(DEDUPE_FILE)) {
-      const content = fs.readFileSync(DEDUPE_FILE, 'utf8');
-      const list = JSON.parse(content);
-      return res.json(Array.isArray(list) ? list : []);
-    }
-    return res.json([]);
+    const list = await db.getAllKeys();
+    res.json(list);
   } catch (err) {
-    addLog('error', `Failed to read crawled_asins.json: ${err.message}`);
+    addLog('error', `Failed to read ASIN database: ${err.message}`);
     res.status(500).json({ error: 'Failed to read ASIN database' });
   }
 });
 
 // 4. ASIN Database Delete Key API
-app.delete('/api/asins/:key', checkAuth, (req, res) => {
+app.delete('/api/asins/:key', checkAuth, async (req, res) => {
   const keyToDelete = req.params.key;
   try {
-    if (fs.existsSync(DEDUPE_FILE)) {
-      const content = fs.readFileSync(DEDUPE_FILE, 'utf8');
-      let list = JSON.parse(content);
-      if (Array.isArray(list)) {
-        const index = list.indexOf(keyToDelete);
-        if (index !== -1) {
-          list.splice(index, 1);
-          fs.writeFileSync(DEDUPE_FILE, JSON.stringify(list, null, 2), 'utf8');
-          addLog('success', `Deleted product key "${keyToDelete}" from database`);
-          return res.json({ success: true, message: `Key ${keyToDelete} deleted` });
-        }
-      }
+    const deleted = await db.deleteKey(keyToDelete);
+    if (deleted) {
+      addLog('success', `Deleted product key "${keyToDelete}" from database`);
+      return res.json({ success: true, message: `Key ${keyToDelete} deleted` });
+    } else {
       return res.status(404).json({ error: `Key ${keyToDelete} not found in database` });
     }
-    return res.status(404).json({ error: 'Database file not found' });
   } catch (err) {
     addLog('error', `Failed to delete key "${keyToDelete}": ${err.message}`);
     res.status(500).json({ error: 'Failed to update database' });
@@ -285,19 +258,16 @@ app.post('/api/test-parse', checkAuth, async (req, res) => {
   }
 });
 
-// Start Express Server
-app.listen(PORT, () => {
-  addLog('success', `Bot API Server running on port ${PORT}`);
-});
-
 // ── Telegram Command Helpers ───────────────────────────────────────────────────
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '👋 Welcome! Send me product deals and I will format and post them to Telegram.');
-});
+if (bot) {
+  bot.onText(/\/start/, (msg) => {
+    bot.sendMessage(msg.chat.id, '👋 Welcome! Send me product deals and I will format and post them to Telegram.');
+  });
 
-bot.onText(/\/test/, (msg) => {
-  bot.sendMessage(msg.chat.id, `⚙️ Bot is operational.\nMode: ${isProduction ? 'Webhook' : 'Polling (Local)'}`);
-});
+  bot.onText(/\/test/, (msg) => {
+    bot.sendMessage(msg.chat.id, `⚙️ Bot is operational.\nMode: ${isProduction ? 'Webhook (Firebase)' : 'Polling (Local)'}`);
+  });
+}
 
 // ── Scrape with Hard Timeout ───────────────────────────────────────────────────
 const SCRAPE_TIMEOUT_MS = 22000;
@@ -343,121 +313,145 @@ async function downloadImageBuffer(imageUrl) {
 }
 
 // ── Main Message Listener ──────────────────────────────────────────────────────
-bot.on('message', async (msg) => {
-  try {
-    // Skip bot messages
-    if (msg.from && msg.from.is_bot) return;
+if (bot) {
+  bot.on('message', async (msg) => {
+    try {
+      if (msg.from && msg.from.is_bot) return;
+      if (!msg.text && !msg.caption) return;
 
-    // Skip service/system messages
-    if (!msg.text && !msg.caption) return;
+      const rawText = msg.text || msg.caption || '';
+      if (rawText.trim().startsWith('/') || rawText.trim().length < 5) return;
 
-    const rawText = msg.text || msg.caption || '';
+      metrics.totalProcessed++;
+      addLog('info', `Received telegram deal message from ${msg.from?.username || msg.from?.first_name || 'Anonymous'}`);
 
-    // Ignore slash commands and very short inputs
-    if (rawText.trim().startsWith('/') || rawText.trim().length < 5) return;
+      const products = parseMessage(rawText);
+      if (!products || products.length === 0) {
+        addLog('warning', 'No product links extracted from message');
+        try {
+          await bot.sendMessage(
+            msg.chat.id,
+            '⚠️ No product links found. Please include an Amazon, Walmart, or eBay URL.',
+            { reply_to_message_id: msg.message_id }
+          );
+        } catch (tgErr) {
+          addLog('error', `Failed to send link warning message: ${tgErr.message}`);
+        }
+        return;
+      }
 
-    metrics.totalProcessed++;
-    addLog('info', `Received telegram deal message from ${msg.from?.username || msg.from?.first_name || 'Anonymous'}`);
+      addLog('info', `Extracted ${products.length} product link(s). Processing...`);
 
-    // 1. Parse product links from message
-    const products = parseMessage(rawText);
-    if (!products || products.length === 0) {
-      addLog('warning', 'No product links extracted from message');
+      for (const product of products) {
+        const productKey = extractProductKey(product.link);
+
+        // Atomic Deduplication Check via Firestore / Local fallback
+        const isNew = await db.checkAndAddProductKey(productKey, {
+          asin: productKey,
+          price: product.price,
+          units: product.units
+        });
+
+        if (!isNew) {
+          addLog('info', `[Dedupe] Skipping already processed deal: ${productKey}`);
+          continue;
+        }
+
+        const scraped = await scrapeWithTimeout(product.link);
+
+        const isScrapeFailed = scraped.title === 'Product' || scraped.title === 'Product Title' || (scraped.upc === 'Not Found' && !scraped.imageUrl);
+        if (isScrapeFailed) {
+          metrics.failedScrapes++;
+          addLog('warning', `Failed to scrape rich data for: ${product.link}`);
+        } else {
+          metrics.successfulScrapes++;
+          addLog('success', `Scrape successful for "${scraped.title.substring(0, 40)}..."`);
+        }
+
+        const postLines = [];
+        if (scraped.upc && scraped.upc !== 'Not Found')                     postLines.push(`UPC: ${scraped.upc}`);
+        if (product.price && product.price !== 'N/A')                       postLines.push(`Price: ${product.price}`);
+        if (product.units && product.units !== 'N/A')                       postLines.push(`Units: ${formatUnits(product.units)}`);
+        if (product.fob && product.fob !== 'N/A' && product.fob !== 'null') postLines.push(`FOB: ${product.fob}`);
+        if (product.exp && product.exp !== 'N/A' && product.exp !== 'null') postLines.push(`Exp: ${product.exp}`);
+        postLines.push(`Link: ${product.link}`);
+        const formattedTelegramPost = postLines.join('\n');
+
+        const telegramOptions = { reply_to_message_id: msg.message_id };
+
+        let photoSent = false;
+        if (scraped.imageUrl) {
+          try {
+            const imgBuffer = await downloadImageBuffer(scraped.imageUrl);
+            if (imgBuffer) {
+              await bot.sendPhoto(msg.chat.id, imgBuffer, {
+                caption: formattedTelegramPost,
+                ...telegramOptions
+              }, {
+                filename: 'product.jpg',
+                contentType: 'image/jpeg'
+              });
+              photoSent = true;
+              addLog('success', 'Sent photo deal card (via buffer) to Telegram successfully');
+            } else {
+              await bot.sendPhoto(msg.chat.id, scraped.imageUrl, {
+                caption: formattedTelegramPost,
+                ...telegramOptions
+              });
+              photoSent = true;
+              addLog('success', 'Sent photo deal card (via URL) to Telegram successfully');
+            }
+          } catch (photoErr) {
+            addLog('warning', `Photo deal send failed (${photoErr.message}), falling back to text`);
+          }
+        }
+
+        if (!photoSent) {
+          try {
+            await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
+            addLog('success', 'Sent text-only deal card to Telegram successfully');
+          } catch (textErr) {
+            addLog('error', `Text send failed: ${textErr.message}`);
+          }
+        }
+      }
+
+    } catch (err) {
+      addLog('error', `Fatal message handler error: ${err.message}`, { stack: err.stack });
       try {
         await bot.sendMessage(
           msg.chat.id,
-          '⚠️ No product links found. Please include an Amazon, Walmart, or eBay URL.',
+          `❌ Error: ${err.message}`,
           { reply_to_message_id: msg.message_id }
         );
       } catch (tgErr) {
-        addLog('error', `Failed to send link warning message: ${tgErr.message}`);
-      }
-      return;
-    }
-
-    addLog('info', `Extracted ${products.length} product link(s). Scraping metadata...`);
-
-    // 2. Process each product link
-    for (const product of products) {
-      const productKey = extractProductKey(product.link);
-      const isNew = checkAndAddProductKey(productKey);
-      if (!isNew) {
-        addLog('info', `[Dedupe] Skipping duplicate deal: ${productKey}`);
-        continue;
-      }
-
-      const scraped = await scrapeWithTimeout(product.link);
-
-      const isScrapeFailed = scraped.title === 'Product' || scraped.title === 'Product Title' || (scraped.upc === 'Not Found' && !scraped.imageUrl);
-      if (isScrapeFailed) {
-        metrics.failedScrapes++;
-        addLog('warning', `Failed to scrape rich data (using fallbacks) for: ${product.link}`);
-      } else {
-        metrics.successfulScrapes++;
-        addLog('success', `Scrape successful for "${scraped.title.substring(0, 40)}..."`);
-      }
-
-      const postLines = [];
-      if (scraped.upc && scraped.upc !== 'Not Found')                     postLines.push(`UPC: ${scraped.upc}`);
-      if (product.price && product.price !== 'N/A')                       postLines.push(`Price: ${product.price}`);
-      if (product.units && product.units !== 'N/A')                       postLines.push(`Units: ${formatUnits(product.units)}`);
-      if (product.fob && product.fob !== 'N/A' && product.fob !== 'null') postLines.push(`FOB: ${product.fob}`);
-      if (product.exp && product.exp !== 'N/A' && product.exp !== 'null') postLines.push(`Exp: ${product.exp}`);
-      postLines.push(`Link: ${product.link}`);
-      const formattedTelegramPost = postLines.join('\n');
-
-      const telegramOptions = { reply_to_message_id: msg.message_id };
-
-      // 3. Send with image if available (using buffer upload to prevent crawler blocks)
-      let photoSent = false;
-      if (scraped.imageUrl) {
-        try {
-          const imgBuffer = await downloadImageBuffer(scraped.imageUrl);
-          if (imgBuffer) {
-            await bot.sendPhoto(msg.chat.id, imgBuffer, {
-              caption: formattedTelegramPost,
-              ...telegramOptions
-            }, {
-              filename: 'product.jpg',
-              contentType: 'image/jpeg'
-            });
-            photoSent = true;
-            addLog('success', 'Sent photo deal card (via buffer) to Telegram successfully');
-          } else {
-            await bot.sendPhoto(msg.chat.id, scraped.imageUrl, {
-              caption: formattedTelegramPost,
-              ...telegramOptions
-            });
-            photoSent = true;
-            addLog('success', 'Sent photo deal card (via URL) to Telegram successfully');
-          }
-        } catch (photoErr) {
-          addLog('warning', `Photo deal send failed (${photoErr.message}), falling back to text`);
-        }
-      }
-
-      if (!photoSent) {
-        try {
-          await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
-          addLog('success', 'Sent text-only deal card to Telegram successfully');
-        } catch (textErr) {
-          addLog('error', `Text send failed: ${textErr.message}`);
-        }
+        addLog('error', `Failed to send incident alert to Telegram: ${tgErr.message}`);
       }
     }
+  });
+}
 
-  } catch (err) {
-    addLog('error', `Fatal message handler error: ${err.message}`, { stack: err.stack });
-    try {
-      await bot.sendMessage(
-        msg.chat.id,
-        `❌ Error: ${err.message}`,
-        { reply_to_message_id: msg.message_id }
-      );
-    } catch (tgErr) {
-      addLog('error', `Failed to send incident alert to Telegram: ${tgErr.message}`);
-    }
-  }
-});
+// ── Execution: Local Server vs Firebase HTTPS Cloud Function ──────────────────
+if (require.main === module && !isCloudFunction) {
+  app.listen(PORT, () => {
+    addLog('success', `Dashboard Web Server running locally on port ${PORT}`);
+  });
+}
 
-module.exports = app;
+// Export Firebase Cloud Function (v2 HTTPS)
+let botFunction;
+try {
+  const { onRequest } = require('firebase-functions/v2/https');
+  botFunction = onRequest(
+    {
+      timeoutSeconds: 60,
+      memory: '512MiB',
+      region: 'us-central1'
+    },
+    app
+  );
+} catch (e) {
+  botFunction = app;
+}
+
+module.exports = { app, bot: botFunction };

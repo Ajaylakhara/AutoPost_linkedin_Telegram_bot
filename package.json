@@ -3,14 +3,21 @@
   "version": "1.0.0",
   "description": "An advanced Telegram bot that scrapes product links, expands URLs, deduplicates postings, and formats retail closeout listings into clean deal cards.",
   "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "deploy": "firebase deploy",
+    "setup-webhook": "node scripts/setup-webhook.js"
   },
   "dependencies": {
     "axios": "^1.17.0",
     "cheerio": "^1.2.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "firebase-admin": "^12.0.0",
+    "firebase-functions": "^5.0.0",
     "node-telegram-bot-api": "^0.66.0"
   }
 }

@@ -1,0 +1,51 @@
+name: Deploy to Firebase (Functions & Hosting)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_deploy:
+    name: Deploy Live Backend & Hosting to Firebase
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci || npm install
+
+      - name: Deploy to Firebase
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "❌ Error: FIREBASE_SERVICE_ACCOUNT secret is missing."
+            exit 1
+          fi
+          
+          if [ -z "$FIREBASE_PROJECT_ID" ]; then
+            echo "❌ Error: FIREBASE_PROJECT_ID secret is missing."
+            exit 1
+          fi
+
+          echo "$FIREBASE_SERVICE_ACCOUNT" > "$RUNNER_TEMP/sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
+
+          echo "🚀 Deploying Cloud Functions, Hosting, and Firestore rules..."
+          npx --yes firebase-tools deploy \
+            --only functions,hosting,firestore:rules,firestore:indexes \
+            --project "$FIREBASE_PROJECT_ID" \
+            --non-interactive
+
+          rm -f "$RUNNER_TEMP/sa.json"
+          echo "✅ Firebase deployment completed successfully!"

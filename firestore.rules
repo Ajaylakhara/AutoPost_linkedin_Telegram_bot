@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Direct browser public access is blocked.
+    // Cloud Functions use Firebase Admin SDK which bypasses security rules.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

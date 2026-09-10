@@ -1,4 +1,18 @@
 {
+  "functions": [
+    {
+      "source": ".",
+      "codebase": "default",
+      "runtime": "nodejs20",
+      "ignore": [
+        ".git",
+        ".github",
+        "firebase-debug.log",
+        "firestore-debug.log",
+        "ui-debug.log"
+      ]
+    }
+  ],
   "hosting": {
     "public": "public",
     "ignore": [
@@ -8,9 +22,34 @@
     ],
     "rewrites": [
       {
+        "source": "/api/**",
+        "function": {
+          "functionId": "bot",
+          "region": "us-central1"
+        }
+      },
+      {
+        "source": "/health",
+        "function": {
+          "functionId": "bot",
+          "region": "us-central1"
+        }
+      },
+      {
+        "source": "/telegram-webhook",
+        "function": {
+          "functionId": "bot",
+          "region": "us-central1"
+        }
+      },
+      {
         "source": "**",
         "destination": "/index.html"
       }
     ]
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
   }
 }
