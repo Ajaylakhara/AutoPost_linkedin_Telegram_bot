@@ -1,18 +1,11 @@
 /**
  * Parser Utility module for parsing product deals.
  *
- * FIX LOG:
- *  - Multi-link messages: Product 2 was getting Product 1's price/units.
- *    Root cause: blockText for URL[i] started from END of URL[i-1], picking
- *    up price/units text between the two URLs.
- *    Fix: Block for URL[i] now starts at URL[i]'s own position, not after URL[i-1].
- *
- *  - FOB / Exp at end of message (after all URLs) showed N/A for all products.
- *    Fix: Global FOB/Exp extracted from full message text and used as fallback
- *    when a product's own block doesn't contain those fields.
- *
- *  - Non-breaking spaces (\u00A0) caused regex mismatches → normalize first.
- *  - "3,600 Units Available" suffix format added.
+ * Features:
+ *  - URL & ASIN extraction
+ *  - Regex extraction for Price, Units, FOB, Exp date
+ *  - Normalizes text & Unicode non-breaking spaces
+ *  - Deduplication check with local crawled_asins.json
  */
 
 const fs = require('fs');
@@ -34,9 +27,7 @@ function normalizeText(text) {
 }
 
 /**
- * Extracts price from text.
- * Supports: $3.95, $140, $3,499.00
- * Returns null if not found (so caller can distinguish "not found" from default).
+ * Extracts price from text ($3.95, $140, $3,499.00).
  */
 function extractPrice(text) {
   const match = text.match(/(\$[0-9,]+(?:\.[0-9]+)?)/);
@@ -44,29 +35,24 @@ function extractPrice(text) {
 }
 
 /**
- * Extracts unit count from text.
- * Supports:
- *   "Units: 3600", "Units - 3600", "3,600 Units Available", "120 Units"
- *   "12k units", "12K", "1.5k units", "1.5K"
- * Returns null if not found.
+ * Extracts unit count from text ("Units: 3600", "3,600 Units Available", "12k units", etc.).
  */
 function expandK(str) {
-  // Convert "12k" / "1.5K" → numeric string "12000" / "1500"
   const m = str.replace(/,/g, '').match(/^(\d+(?:\.\d+)?)\s*[kK]$/);
   if (m) return String(Math.round(parseFloat(m[1]) * 1000));
   return str.replace(/,/g, '');
 }
 
 function extractUnits(text) {
-  // Format 1: "Units: 3600" or "Units - 3600" or "Units: 12k" (label before number)
+  // Format 1: "Units: 3600" or "Units - 3600"
   const prefixMatch = text.match(/Units?\s*[:\-]?\s*([\d,]+(?:\.\d+)?[kK]?)/i);
   if (prefixMatch) return expandK(prefixMatch[1]);
 
-  // Format 2: "3,600 Units Available" or "120 Units" or "12k Units" (number before label)
+  // Format 2: "3,600 Units Available"
   const suffixMatch = text.match(/([\d,]+(?:\.\d+)?[kK]?)\s+Units?/i);
   if (suffixMatch) return expandK(suffixMatch[1]);
 
-  // Format 3: Standalone number-only line (plain number or k-shorthand, not a price)
+  // Format 3: Standalone number-only line
   const lines = text.split('\n');
   for (const line of lines) {
     const clean = line.trim();
@@ -80,8 +66,6 @@ function extractUnits(text) {
 
 /**
  * Extracts FOB location from text.
- * Supports: "FOB: NY", "FOB - NY", "FOB NY"
- * Returns null if not found.
  */
 function extractFob(text) {
   const match = text.match(/\bFOB\s*[:\-]?\s*([^\n\r,]+)/i);
@@ -90,8 +74,6 @@ function extractFob(text) {
 
 /**
  * Extracts expiry date from text.
- * Supports: "Exp: 12/31", "Exp 07/27", "Expiry: 2025-01-01"
- * Returns null if not found.
  */
 function extractExp(text) {
   const match = text.match(/\bExp(?:iry)?\s*[:\-]?\s*([^\n\r,]+)/i);
@@ -100,24 +82,13 @@ function extractExp(text) {
 
 /**
  * Parses a Telegram message that may contain one or more product deal links.
- *
- * Each URL's associated block = text from that URL up to the next URL.
- * This ensures each product gets its OWN price/units, not a neighboring one.
- * FOB and Exp are pulled from the full message as a global fallback, since
- * they often appear once at the bottom and apply to all products.
- *
- * @param {string} text The raw Telegram message text.
- * @returns {Array<object>} Parsed product objects.
  */
 function parseMessage(text) {
   if (!text || text.trim().length < 5) {
     return [];
   }
 
-  // Normalize special Telegram characters
   const normalizedText = normalizeText(text);
-
-  // Find all URLs
   const linkRegex = /(https?:\/\/[^\s]+)/g;
   const matches = [...normalizedText.matchAll(linkRegex)];
 
@@ -125,8 +96,6 @@ function parseMessage(text) {
     return [];
   }
 
-  // ── Extract GLOBAL fallbacks from the ENTIRE message ─────────────────────
-  // These apply when a product's own text block doesn't have FOB / Exp / Price / Units
   const globalPrice = extractPrice(normalizedText);
   const globalFob   = extractFob(normalizedText);
   const globalExp   = extractExp(normalizedText);
@@ -136,31 +105,10 @@ function parseMessage(text) {
 
   for (let i = 0; i < matches.length; i++) {
     const link = matches[i][0];
-
-    // ── Build this product's block ──────────────────────────────────────────
-    // IMPORTANT: Block starts at the CURRENT URL's position (not end of prev URL).
-    // This guarantees each product's $price and units are read from its own section.
-    //
-    // Example message:
-    //   https://url1       ← URL1 position
-    //   $1.50              ← belongs to product 1
-    //   8,064 Units
-    //
-    //   https://url2       ← URL2 position
-    //   $6.50              ← belongs to product 2
-    //   2,400 Units
-    //
-    //   Exp 07/27          ← global (no URL prefix)
-    //   FOB - IL           ← global (no URL prefix)
-    //
-    // blockText for URL1 = "https://url1\n$1.50\n8,064 Units\n\n"
-    // blockText for URL2 = "https://url2\n$6.50\n2,400 Units\n\nExp 07/27\nFOB - IL"
-
     const blockStart = matches[i].index;
     const blockEnd   = i < matches.length - 1 ? matches[i + 1].index : normalizedText.length;
     const blockText  = normalizedText.substring(blockStart, blockEnd);
 
-    // Extract from block first, fall back to global if not found
     const price = extractPrice(blockText) || globalPrice || null;
     const units = extractUnits(blockText) || globalUnits || null;
     const fob   = extractFob(blockText)   || globalFob   || null;
@@ -173,11 +121,8 @@ function parseMessage(text) {
 }
 
 /**
- * Checks if a product has already been posted.
- * Adds the key to crawled_asins.json if new.
- *
- * @param {string} key Unique identifier for the product.
- * @returns {boolean} True if new/added, false if duplicate.
+ * Checks if a product key has already been crawled/posted.
+ * Adds key to crawled_asins.json if new.
  */
 function checkAndAddProductKey(key) {
   if (!key || key === 'unknown') return true;
@@ -187,6 +132,7 @@ function checkAndAddProductKey(key) {
     if (fs.existsSync(DEDUPE_FILE)) {
       const content = fs.readFileSync(DEDUPE_FILE, 'utf8');
       database = JSON.parse(content);
+      if (!Array.isArray(database)) database = [];
     }
   } catch (e) {
     console.error('[Dedupe Read Error]', e.message);
@@ -208,5 +154,10 @@ function checkAndAddProductKey(key) {
 
 module.exports = {
   parseMessage,
-  checkAndAddProductKey
+  checkAndAddProductKey,
+  normalizeText,
+  extractPrice,
+  extractUnits,
+  extractFob,
+  extractExp
 };

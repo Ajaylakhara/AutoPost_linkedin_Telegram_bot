@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AutoPost Telegram Bot — Control Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-primary: #0b0c10;
+      --bg-surface: #14161f;
+      --bg-surface-alt: #1d202d;
+      --border-color: #272a3a;
+      --accent-color: #6366f1;
+      --accent-hover: #4f46e5;
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --info: #38bdf8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 900px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      font-size: 2.2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 6px;
+    }
+
+    .subtitle {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      margin-bottom: 16px;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 16px;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--success);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+
+    .status-badge.offline {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--danger);
+      border-color: rgba(239, 68, 68, 0.25);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: currentColor;
+    }
+
+    /* Backend Connection Bar */
+    .config-bar {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 12px 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 24px;
+    }
+
+    .config-bar label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    .config-bar input {
+      flex: 1;
+      min-width: 200px;
+      background: var(--bg-surface-alt);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 8px 12px;
+      color: var(--text-main);
+      font-size: 0.88rem;
+    }
+
+    .config-bar button {
+      background: var(--accent-color);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 16px;
+      font-weight: 600;
+      font-size: 0.88rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .config-bar button:hover {
+      background: var(--accent-hover);
+    }
+
+    /* Metric Cards */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .metric-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+      transition: transform 0.2s, border-color 0.2s;
+    }
+
+    .metric-card:hover {
+      transform: translateY(-2px);
+      border-color: #3b3f54;
+    }
+
+    .metric-value {
+      font-size: 1.9rem;
+      font-weight: 700;
+      color: var(--text-main);
+      margin-bottom: 4px;
+    }
+
+    .metric-value.info { color: var(--info); }
+    .metric-value.success { color: var(--success); }
+    .metric-value.warning { color: var(--warning); }
+
+    .metric-label {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* Section Cards */
+    .card-panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .panel-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    /* Table */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+
+    th {
+      background: var(--bg-surface-alt);
+      color: var(--text-muted);
+      text-align: left;
+      padding: 10px 12px;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    td {
+      padding: 10px 12px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    /* Playground */
+    .playground-area textarea {
+      width: 100%;
+      height: 90px;
+      background: var(--bg-surface-alt);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 12px;
+      color: var(--text-main);
+      font-family: inherit;
+      font-size: 0.9rem;
+      resize: vertical;
+      margin-bottom: 12px;
+    }
+
+    .playground-results {
+      margin-top: 12px;
+      background: #00000033;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 0.85rem;
+      white-space: pre-wrap;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    footer {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      margin-top: 24px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🤖 AutoPost Bot</h1>
+      <p class="subtitle">Real-time Telegram Deal Formatter & Scraping Engine</p>
+      <div id="statusBadge" class="status-badge">
+        <span class="dot"></span>
+        <span id="statusText">CHECKING STATUS...</span>
+      </div>
+    </header>
+
+    <!-- Backend Configuration -->
+    <div class="config-bar">
+      <label for="apiUrl">Backend API URL:</label>
+      <input type="text" id="apiUrl" placeholder="e.g. http://localhost:3000 or https://your-backend.onrender.com" />
+      <label for="apiKey">API Key:</label>
+      <input type="password" id="apiKey" placeholder="Optional passcode" />
+      <button onclick="saveAndRefresh()">Connect</button>
+    </div>
+
+    <!-- Metrics Overview -->
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div id="metricUptime" class="metric-value info">0s</div>
+        <div class="metric-label">Server Uptime</div>
+      </div>
+      <div class="metric-card">
+        <div id="metricProcessed" class="metric-value">0</div>
+        <div class="metric-label">Messages Processed</div>
+      </div>
+      <div class="metric-card">
+        <div id="metricSuccess" class="metric-value success">0</div>
+        <div class="metric-label">Successful Scrapes</div>
+      </div>
+      <div class="metric-card">
+        <div id="metricFailed" class="metric-value warning">0</div>
+        <div class="metric-label">Failed Scrapes</div>
+      </div>
+    </div>
+
+    <!-- Recent Logs -->
+    <div class="card-panel">
+      <div class="panel-header">
+        <div class="panel-title">Recent Activity Logs</div>
+        <button onclick="fetchStatusAndLogs()" style="background:none; border:none; color:var(--accent-color); font-size:0.85rem; cursor:pointer;">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 80px;">Type</th>
+            <th style="width: 100px;">Time</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody id="logsBody">
+          <tr><td colspan="3" style="text-align: center; color: var(--text-muted);">Loading logs...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Parser Playground Sandbox -->
+    <div class="card-panel">
+      <div class="panel-header">
+        <div class="panel-title">Interactive Deal Sandbox</div>
+      </div>
+      <div class="playground-area">
+        <textarea id="sandboxText" placeholder="Paste sample deal text containing an Amazon, Walmart, or eBay link with price and units to test the parser..."></textarea>
+        <button onclick="testParse()" style="background: var(--accent-color); color: white; border: none; border-radius: 8px; padding: 8px 18px; font-weight: 600; cursor: pointer;">Test Parser</button>
+        <div id="sandboxResults" class="playground-results" style="display: none;"></div>
+      </div>
+    </div>
+
+    <footer>
+      AutoPost Bot Dashboard &bull; Hosted on Firebase Hosting (Spark Plan)
+    </footer>
+  </div>
+
+  <script>
+    // =========================================================================
+    // 🔧 BACKEND API CONFIGURATION
+    // -------------------------------------------------------------------------
+    // Set your production backend URL here if you want it pre-filled automatically
+    // Example: const DEFAULT_PRODUCTION_BACKEND_URL = 'https://your-bot.onrender.com';
+    // Otherwise, you can type it into the "Backend API URL" input bar on the page.
+    // =========================================================================
+    const DEFAULT_PRODUCTION_BACKEND_URL = '';
+
+    const DEFAULT_API = DEFAULT_PRODUCTION_BACKEND_URL || (
+      window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+        ? 'http://localhost:3000'
+        : (localStorage.getItem('backend_api_url') || '')
+    );
+
+    document.getElementById('apiUrl').value = localStorage.getItem('backend_api_url') || DEFAULT_API;
+    document.getElementById('apiKey').value = localStorage.getItem('backend_api_key') || '';
+
+    function getApiUrl() {
+      let url = document.getElementById('apiUrl').value.trim();
+      if (url.endsWith('/')) url = url.slice(0, -1);
+      return url || DEFAULT_API;
+    }
+
+    function getApiKey() {
+      return document.getElementById('apiKey').value.trim();
+    }
+
+    function saveAndRefresh() {
+      localStorage.setItem('backend_api_url', getApiUrl());
+      localStorage.setItem('backend_api_key', getApiKey());
+      fetchStatusAndLogs();
+    }
+
+    function formatUptime(seconds) {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      return `${h}h ${m}m ${s}s`;
+    }
+
+    async function fetchStatusAndLogs() {
+      const baseUrl = getApiUrl();
+      const apiKey = getApiKey();
+      const headers = apiKey ? { 'x-api-key': apiKey } : {};
+
+      try {
+        const [statusRes, logsRes] = await Promise.all([
+          fetch(`${baseUrl}/api/status`, { headers }).then(r => r.json()).catch(() => null),
+          fetch(`${baseUrl}/api/logs`, { headers }).then(r => r.json()).catch(() => [])
+        ]);
+
+        const badge = document.getElementById('statusBadge');
+        const badgeText = document.getElementById('statusText');
+
+        if (statusRes && statusRes.status === 'online') {
+          badge.className = 'status-badge';
+          badgeText.textContent = `ONLINE (${statusRes.mode.toUpperCase()})`;
+
+          document.getElementById('metricUptime').textContent = formatUptime(statusRes.uptime || 0);
+          document.getElementById('metricProcessed').textContent = statusRes.metrics?.totalProcessed || 0;
+          document.getElementById('metricSuccess').textContent = statusRes.metrics?.successfulScrapes || 0;
+          document.getElementById('metricFailed').textContent = statusRes.metrics?.failedScrapes || 0;
+        } else {
+          badge.className = 'status-badge offline';
+          badgeText.textContent = 'BACKEND OFFLINE / UNREACHABLE';
+        }
+
+        const logsBody = document.getElementById('logsBody');
+        if (Array.isArray(logsRes) && logsRes.length > 0) {
+          logsBody.innerHTML = logsRes.slice(-8).reverse().map(l => {
+            const color = l.type === 'error' ? 'var(--danger)' : l.type === 'warning' ? 'var(--warning)' : l.type === 'success' ? 'var(--success)' : 'var(--text-muted)';
+            const time = new Date(l.timestamp).toLocaleTimeString();
+            return `<tr>
+              <td style="color: ${color}; font-weight: 600;">${l.type.toUpperCase()}</td>
+              <td style="color: var(--text-muted);">${time}</td>
+              <td>${l.message}</td>
+            </tr>`;
+          }).join('');
+        } else {
+          logsBody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted);">No logs available</td></tr>';
+        }
+
+      } catch (err) {
+        const badge = document.getElementById('statusBadge');
+        const badgeText = document.getElementById('statusText');
+        badge.className = 'status-badge offline';
+        badgeText.textContent = 'CONNECTION ERROR';
+      }
+    }
+
+    async function testParse() {
+      const baseUrl = getApiUrl();
+      const apiKey = getApiKey();
+      const text = document.getElementById('sandboxText').value;
+      const resBox = document.getElementById('sandboxResults');
+
+      if (!text.trim()) {
+        alert('Please enter deal text');
+        return;
+      }
+
+      resBox.style.display = 'block';
+      resBox.textContent = 'Parsing and scraping product metadata...';
+
+      try {
+        const res = await fetch(`${baseUrl}/api/test-parse`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(apiKey ? { 'x-api-key': apiKey } : {})
+          },
+          body: JSON.stringify({ text })
+        });
+        const data = await res.json();
+        resBox.textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        resBox.textContent = 'Error: ' + e.message;
+      }
+    }
+
+    fetchStatusAndLogs();
+    setInterval(fetchStatusAndLogs, 10000);
+  </script>
+</body>
+</html>

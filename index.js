@@ -1,15 +1,11 @@
 /**
- * 🤖 AutoPost Telegram Bot (Main Orchestrator with Status Dashboard)
+ * 🤖 AutoPost Telegram Bot (Backend Server + API)
  *
  * Flow:
- * 1. Runs an Express HTTP server (health check + Telegram webhooks + Web Dashboard APIs).
- * 2. Connects to Telegram using webhook (in production) or polling (local dev).
- * 3. Listens for incoming product deal messages.
- * 4. Parses deals using utils.js.
- * 5. Scrapes product details (title, image, UPC) using scraper.js with timeout.
- * 6. Formats deal messages.
- * 7. Automatically posts to Telegram — ALWAYS responds, even on scrape failure.
- * 8. Exposes APIs to monitor bot health, webhook config, recent logs, ASIN database, and sandbox testing.
+ * 1. Runs an Express HTTP server (health check, status APIs, ASIN DB, Telegram Webhook/Polling).
+ * 2. Connects to Telegram (Polling for local dev, Webhook in production).
+ * 3. Listens for incoming product deal messages, parses deals, scrapes metadata, deduplicates, and posts to Telegram.
+ * 4. Exposes REST APIs for the Firebase Hosting Dashboard.
  */
 
 require('dotenv').config();
@@ -19,12 +15,24 @@ const path = require('path');
 const fs = require('fs');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const { parseMessage } = require('./utils');
-const { scrapeProductData } = require('./scraper');
+const { parseMessage, checkAndAddProductKey } = require('./utils');
+const { scrapeProductData, extractProductKey } = require('./scraper');
 
 // Express App Initialization
 const app = express();
 app.use(express.json());
+
+// Enable CORS for Firebase Hosting dashboard
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, x-api-key');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 
 // ── In-Memory Logging System ───────────────────────────────────────────────────
@@ -46,7 +54,7 @@ function addLog(type, message, metadata = null) {
     logBuffer.shift();
   }
 
-  // Also output to console
+  // Console output
   const consoleMsg = `[${type.toUpperCase()}] ${message}`;
   if (type === 'error') {
     console.error(consoleMsg, metadata ? JSON.stringify(metadata) : '');
@@ -73,7 +81,7 @@ process.on('uncaughtException', (err) => {
 
 // ── Telegram Bot Configuration ─────────────────────────────────────────────────
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const isProduction = !!process.env.RENDER_EXTERNAL_URL;
+const isProduction = !!(process.env.RENDER_EXTERNAL_URL || process.env.WEBHOOK_URL);
 let bot;
 
 if (!BOT_TOKEN) {
@@ -84,8 +92,9 @@ if (!BOT_TOKEN) {
 addLog('info', 'Initializing Telegram bot...');
 if (isProduction) {
   bot = new TelegramBot(BOT_TOKEN, { polling: false });
-  const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/telegram-webhook`;
-  
+  const serverUrl = process.env.RENDER_EXTERNAL_URL || process.env.WEBHOOK_URL;
+  const webhookUrl = `${serverUrl}/telegram-webhook`;
+
   async function syncWebhook(url, retries = 5, delay = 2500) {
     try {
       const info = await bot.getWebHookInfo();
@@ -97,7 +106,7 @@ if (isProduction) {
       addLog('success', `Webhook registered successfully at: ${url}`);
     } catch (err) {
       if (retries > 0 && err.message.includes('429')) {
-        addLog('warning', `Telegram rate limited (429). Retrying webhook sync in ${delay / 1000}s...`);
+        addLog('warning', `Telegram rate limited (429). Retrying in ${delay / 1000}s...`);
         setTimeout(() => syncWebhook(url, retries - 1, delay * 2), delay);
       } else {
         addLog('error', `Webhook setup failed: ${err.message}`);
@@ -110,7 +119,6 @@ if (isProduction) {
   bot = new TelegramBot(BOT_TOKEN, { polling: true });
   addLog('info', 'Bot started in Polling mode (Local dev)');
 
-  // Gracefully handle polling connection errors (e.g. network timeouts, blocked ISP connections)
   bot.on('polling_error', (error) => {
     addLog('warning', `Telegram connection warning (polling failed): ${error.message}`);
   });
@@ -120,7 +128,7 @@ if (isProduction) {
 const checkAuth = (req, res, next) => {
   const apiKey = process.env.DASHBOARD_API_KEY;
   if (!apiKey) {
-    return next(); // Passcode protection disabled if DASHBOARD_API_KEY is not defined
+    return next(); // Protection disabled if DASHBOARD_API_KEY is not defined
   }
 
   const providedKey = req.headers['x-api-key'] || req.query.apiKey;
@@ -132,76 +140,28 @@ const checkAuth = (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized. Invalid or missing API key.' });
 };
 
-
-
 // ── Express Endpoints ──────────────────────────────────────────────────────────
 
-// 0. Root Dashboard — fixes "Cannot GET /" shown in browser
+// 0. Root Endpoint
 app.get('/', (req, res) => {
-  const uptime = Math.floor(process.uptime());
-  const hours  = Math.floor(uptime / 3600);
-  const mins   = Math.floor((uptime % 3600) / 60);
-  const secs   = uptime % 60;
-  const uptimeStr = `${hours}h ${mins}m ${secs}s`;
-  const mode = isProduction ? '🌐 Webhook (Render)' : '💻 Polling (Local Dev)';
-  const recentLogs = logBuffer.slice(-8).reverse();
-
-  const logRows = recentLogs.map(l => {
-    const color = l.type === 'error' ? '#ff6b6b' : l.type === 'warning' ? '#ffd93d' : l.type === 'success' ? '#6bcb77' : '#adb5bd';
-    const time  = new Date(l.timestamp).toLocaleTimeString();
-    return `<tr><td style="color:${color};padding:4px 8px;white-space:nowrap">${l.type.toUpperCase()}</td><td style="padding:4px 8px;color:#ccc;white-space:nowrap">${time}</td><td style="padding:4px 12px;color:#e0e0e0">${l.message}</td></tr>`;
-  }).join('');
-
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="30">
-  <title>AutoPost Bot — Status</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#0f0f14;color:#e0e0e0;font-family:'Segoe UI',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:40px 16px}
-    h1{font-size:2rem;font-weight:700;color:#fff;margin-bottom:4px}
-    .sub{color:#888;font-size:.9rem;margin-bottom:32px}
-    .cards{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;margin-bottom:32px}
-    .card{background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;padding:20px 28px;min-width:160px;text-align:center}
-    .card .val{font-size:1.8rem;font-weight:700;color:#6bcb77}
-    .card .val.warn{color:#ffd93d}
-    .card .val.info{color:#74b9ff}
-    .card .lbl{font-size:.78rem;color:#888;margin-top:4px;text-transform:uppercase;letter-spacing:.05em}
-    .badge{display:inline-block;background:#6bcb7722;color:#6bcb77;border:1px solid #6bcb7755;border-radius:20px;padding:4px 14px;font-size:.85rem;font-weight:600;margin-bottom:24px}
-    table{border-collapse:collapse;width:100%;max-width:760px;background:#1a1a24;border:1px solid #2a2a3a;border-radius:12px;overflow:hidden}
-    th{background:#22223a;padding:8px 12px;text-align:left;font-size:.75rem;color:#888;text-transform:uppercase;letter-spacing:.06em}
-    td{border-top:1px solid #2a2a3a;font-size:.83rem}
-    h2{color:#aaa;font-size:1rem;margin-bottom:12px;text-transform:uppercase;letter-spacing:.08em}
-  </style>
-</head>
-<body>
-  <h1>🤖 AutoPost Bot</h1>
-  <p class="sub">Telegram Deal Formatter — Closeout Products</p>
-  <span class="badge">● ONLINE</span>
-  <div class="cards">
-    <div class="card"><div class="val info">${uptimeStr}</div><div class="lbl">Uptime</div></div>
-    <div class="card"><div class="val">${metrics.totalProcessed}</div><div class="lbl">Messages Processed</div></div>
-    <div class="card"><div class="val">${metrics.successfulScrapes}</div><div class="lbl">Successful Scrapes</div></div>
-    <div class="card"><div class="val warn">${metrics.failedScrapes}</div><div class="lbl">Failed Scrapes</div></div>
-  </div>
-  <p style="color:#666;font-size:.8rem;margin-bottom:20px">Mode: ${mode} &nbsp;|&nbsp; Auto-refreshes every 30s</p>
-  <h2>Recent Activity</h2>
-  <table>
-    <thead><tr><th>Type</th><th>Time</th><th>Message</th></tr></thead>
-    <tbody>${logRows || '<tr><td colspan="3" style="text-align:center;padding:16px;color:#555">No logs yet</td></tr>'}</tbody>
-  </table>
-</body>
-</html>`);
+  res.json({
+    name: 'AutoPost Telegram Bot API Server',
+    status: 'online',
+    uptime: Math.floor(process.uptime()),
+    mode: isProduction ? 'webhook' : 'polling'
+  });
 });
 
-// 0b. Health check endpoint (used by keep-alive ping)
+// 0b. Health Check Endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: Math.floor(process.uptime()), mode: isProduction ? 'webhook' : 'polling' });
+  res.json({
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    mode: isProduction ? 'webhook' : 'polling'
+  });
 });
 
+// 0c. Telegram Webhook Endpoint
 app.post('/telegram-webhook', (req, res) => {
   try {
     bot.processUpdate(req.body);
@@ -211,7 +171,7 @@ app.post('/telegram-webhook', (req, res) => {
   res.sendStatus(200);
 });
 
-// 1. Bot Health & Status
+// 1. Bot Health & Status API
 app.get('/api/status', checkAuth, async (req, res) => {
   let webhookInfo = null;
   try {
@@ -225,7 +185,6 @@ app.get('/api/status', checkAuth, async (req, res) => {
   const envCheck = {
     BOT_TOKEN: !!process.env.BOT_TOKEN,
     PORT: !!process.env.PORT,
-    RENDER_EXTERNAL_URL: !!process.env.RENDER_EXTERNAL_URL,
     DASHBOARD_API_KEY: !!process.env.DASHBOARD_API_KEY
   };
 
@@ -233,7 +192,8 @@ app.get('/api/status', checkAuth, async (req, res) => {
   const successRate = totalScrapes > 0 ? Math.round((metrics.successfulScrapes / totalScrapes) * 100) : 100;
 
   res.json({
-    status: isProduction && (!webhookInfo || webhookInfo.error || !webhookInfo.url) ? 'error' : 'online',
+    status: 'online',
+    mode: isProduction ? 'webhook' : 'polling',
     uptime: Math.floor(process.uptime()),
     webhook: webhookInfo,
     env: envCheck,
@@ -246,19 +206,19 @@ app.get('/api/status', checkAuth, async (req, res) => {
   });
 });
 
-// 2. Logging List
+// 2. Logging List API
 app.get('/api/logs', checkAuth, (req, res) => {
   res.json(logBuffer);
 });
 
-// 3. ASIN Database Read
+// 3. ASIN Database Read API
 const DEDUPE_FILE = path.join(__dirname, 'crawled_asins.json');
 app.get('/api/asins', checkAuth, (req, res) => {
   try {
     if (fs.existsSync(DEDUPE_FILE)) {
       const content = fs.readFileSync(DEDUPE_FILE, 'utf8');
       const list = JSON.parse(content);
-      return res.json(list);
+      return res.json(Array.isArray(list) ? list : []);
     }
     return res.json([]);
   } catch (err) {
@@ -267,22 +227,23 @@ app.get('/api/asins', checkAuth, (req, res) => {
   }
 });
 
-// 4. ASIN Database Delete Key
+// 4. ASIN Database Delete Key API
 app.delete('/api/asins/:key', checkAuth, (req, res) => {
   const keyToDelete = req.params.key;
   try {
     if (fs.existsSync(DEDUPE_FILE)) {
       const content = fs.readFileSync(DEDUPE_FILE, 'utf8');
       let list = JSON.parse(content);
-      const index = list.indexOf(keyToDelete);
-      if (index !== -1) {
-        list.splice(index, 1);
-        fs.writeFileSync(DEDUPE_FILE, JSON.stringify(list, null, 2), 'utf8');
-        addLog('success', `Deleted product key "${keyToDelete}" from database`);
-        return res.json({ success: true, message: `Key ${keyToDelete} deleted` });
-      } else {
-        return res.status(404).json({ error: `Key ${keyToDelete} not found in database` });
+      if (Array.isArray(list)) {
+        const index = list.indexOf(keyToDelete);
+        if (index !== -1) {
+          list.splice(index, 1);
+          fs.writeFileSync(DEDUPE_FILE, JSON.stringify(list, null, 2), 'utf8');
+          addLog('success', `Deleted product key "${keyToDelete}" from database`);
+          return res.json({ success: true, message: `Key ${keyToDelete} deleted` });
+        }
       }
+      return res.status(404).json({ error: `Key ${keyToDelete} not found in database` });
     }
     return res.status(404).json({ error: 'Database file not found' });
   } catch (err) {
@@ -291,18 +252,18 @@ app.delete('/api/asins/:key', checkAuth, (req, res) => {
   }
 });
 
-// 5. Parser Playground Sandbox
+// 5. Parser Playground Sandbox API
 app.post('/api/test-parse', checkAuth, async (req, res) => {
   const { text } = req.body;
   if (!text) {
     return res.status(400).json({ error: 'Text field is required' });
   }
 
-  addLog('info', `Interactive playground processing text trial...`);
+  addLog('info', 'Interactive playground processing text trial...');
   try {
     const products = parseMessage(text);
     if (!products || products.length === 0) {
-      addLog('warning', `Playground parsing yielded 0 products`);
+      addLog('warning', 'Playground parsing yielded 0 products');
       return res.json({ products: [], message: 'No product links found.' });
     }
 
@@ -324,11 +285,9 @@ app.post('/api/test-parse', checkAuth, async (req, res) => {
   }
 });
 
-
-
-// Start Express Listener
+// Start Express Server
 app.listen(PORT, () => {
-  addLog('success', `Dashboard Web Server running on port ${PORT}`);
+  addLog('success', `Bot API Server running on port ${PORT}`);
 });
 
 // ── Telegram Command Helpers ───────────────────────────────────────────────────
@@ -337,11 +296,10 @@ bot.onText(/\/start/, (msg) => {
 });
 
 bot.onText(/\/test/, (msg) => {
-  bot.sendMessage(msg.chat.id, `⚙️ Bot is operational.\nMode: ${isProduction ? 'Webhook (Render)' : 'Polling (Local)'}`);
+  bot.sendMessage(msg.chat.id, `⚙️ Bot is operational.\nMode: ${isProduction ? 'Webhook' : 'Polling (Local)'}`);
 });
 
 // ── Scrape with Hard Timeout ───────────────────────────────────────────────────
-// If scraping hangs, resolve with safe defaults after 22s so bot always replies.
 const SCRAPE_TIMEOUT_MS = 22000;
 
 async function scrapeWithTimeout(url) {
@@ -387,10 +345,10 @@ async function downloadImageBuffer(imageUrl) {
 // ── Main Message Listener ──────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   try {
-    // Skip bot messages — prevents infinite loops
+    // Skip bot messages
     if (msg.from && msg.from.is_bot) return;
 
-    // Skip service/system messages (joins, pins, etc.)
+    // Skip service/system messages
     if (!msg.text && !msg.caption) return;
 
     const rawText = msg.text || msg.caption || '';
@@ -404,7 +362,7 @@ bot.on('message', async (msg) => {
     // 1. Parse product links from message
     const products = parseMessage(rawText);
     if (!products || products.length === 0) {
-      addLog('warning', `No product links extracted from message`);
+      addLog('warning', 'No product links extracted from message');
       try {
         await bot.sendMessage(
           msg.chat.id,
@@ -421,6 +379,13 @@ bot.on('message', async (msg) => {
 
     // 2. Process each product link
     for (const product of products) {
+      const productKey = extractProductKey(product.link);
+      const isNew = checkAndAddProductKey(productKey);
+      if (!isNew) {
+        addLog('info', `[Dedupe] Skipping duplicate deal: ${productKey}`);
+        continue;
+      }
+
       const scraped = await scrapeWithTimeout(product.link);
 
       const isScrapeFailed = scraped.title === 'Product' || scraped.title === 'Product Title' || (scraped.upc === 'Not Found' && !scraped.imageUrl);
@@ -457,14 +422,14 @@ bot.on('message', async (msg) => {
               contentType: 'image/jpeg'
             });
             photoSent = true;
-            addLog('success', `Sent photo deal card (via buffer) to Telegram successfully`);
+            addLog('success', 'Sent photo deal card (via buffer) to Telegram successfully');
           } else {
             await bot.sendPhoto(msg.chat.id, scraped.imageUrl, {
               caption: formattedTelegramPost,
               ...telegramOptions
             });
             photoSent = true;
-            addLog('success', `Sent photo deal card (via URL) to Telegram successfully`);
+            addLog('success', 'Sent photo deal card (via URL) to Telegram successfully');
           }
         } catch (photoErr) {
           addLog('warning', `Photo deal send failed (${photoErr.message}), falling back to text`);
@@ -474,7 +439,7 @@ bot.on('message', async (msg) => {
       if (!photoSent) {
         try {
           await bot.sendMessage(msg.chat.id, formattedTelegramPost, telegramOptions);
-          addLog('success', `Sent text-only deal card to Telegram successfully`);
+          addLog('success', 'Sent text-only deal card to Telegram successfully');
         } catch (textErr) {
           addLog('error', `Text send failed: ${textErr.message}`);
         }
@@ -495,26 +460,4 @@ bot.on('message', async (msg) => {
   }
 });
 
-// ── Keep-alive ping & Webhook auto-maintenance ─────────────────────────────────
-// Ping every 4 minutes — keeps Render awake and ensures webhook stays active
-if (isProduction && process.env.RENDER_EXTERNAL_URL) {
-  const pingUrl = `${process.env.RENDER_EXTERNAL_URL}/health`;
-  setInterval(async () => {
-    https.get(pingUrl).on('error', (err) => {
-      addLog('warning', `Keep-alive ping error: ${err.message}`);
-    });
-
-    // Auto-verify webhook is registered with Telegram
-    try {
-      const webhookInfo = await bot.getWebHookInfo();
-      const expectedWebhookUrl = `${process.env.RENDER_EXTERNAL_URL}/telegram-webhook`;
-      if (!webhookInfo.url || webhookInfo.url !== expectedWebhookUrl) {
-        addLog('warning', `Telegram webhook was missing/unsynced. Auto-registering: ${expectedWebhookUrl}`);
-        await bot.setWebHook(expectedWebhookUrl);
-      }
-    } catch (err) {
-      addLog('warning', `Webhook auto-maintenance check failed: ${err.message}`);
-    }
-  }, 240000); // every 4 minutes
-  addLog('info', `Keep-alive & webhook health checker scheduled every 4 minutes → ${pingUrl}`);
-}
+module.exports = app;
