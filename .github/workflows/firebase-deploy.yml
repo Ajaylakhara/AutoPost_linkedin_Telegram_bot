@@ -25,7 +25,7 @@ jobs:
 
       - name: Deploy to Firebase
         env:
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_AUTOPOST_LINKEDIN_TELEGRAM_BOT }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           FIREBASE_PROJECT_ID: autopost-linkedin-telegram-bot
         run: |
           if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
