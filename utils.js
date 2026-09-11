@@ -27,9 +27,17 @@ function normalizeText(text) {
 }
 
 /**
- * Extracts price from text ($3.95, $140, $3,499.00).
+ * Extracts price from text ($3.95, $140, Price: 250, $3,499.00).
  */
 function extractPrice(text) {
+  if (!text) return null;
+  // Format 1: "Price: $250" or "Price: 250" or "Price - 12.50"
+  const labeledMatch = text.match(/\bPrice\s*[:\-]?\s*(\$?[0-9,]+(?:\.[0-9]+)?)/i);
+  if (labeledMatch) {
+    const val = labeledMatch[1];
+    return val.startsWith('$') ? val : `$${val}`;
+  }
+  // Format 2: Standalone dollar amount ($3.95, $140, $3,499.00)
   const match = text.match(/(\$[0-9,]+(?:\.[0-9]+)?)/);
   return match ? match[1] : null;
 }
@@ -81,6 +89,17 @@ function extractExp(text) {
 }
 
 /**
+ * Extracts UPC / Barcode / EAN / GTIN from text if explicitly provided.
+ */
+function extractUpc(text) {
+  if (!text) return null;
+  // Format: "UPC: 012345678905", "Barcode - 123456789012", "GTIN: 12345678901234", "EAN: 1234567890123"
+  const labeledMatch = text.match(/\b(?:UPC|Barcode|EAN|GTIN)\s*[:\-#]?\s*([0-9]{8,14})\b/i);
+  if (labeledMatch) return labeledMatch[1];
+  return null;
+}
+
+/**
  * Parses a Telegram message that may contain one or more product deal links.
  */
 function parseMessage(text) {
@@ -100,12 +119,23 @@ function parseMessage(text) {
   const globalFob   = extractFob(normalizedText);
   const globalExp   = extractExp(normalizedText);
   const globalUnits = extractUnits(normalizedText);
+  const globalUpc   = extractUpc(normalizedText);
+
+  if (matches.length === 1) {
+    const link = matches[0][0];
+    const price = extractPrice(normalizedText) || globalPrice || null;
+    const units = extractUnits(normalizedText) || globalUnits || null;
+    const fob   = extractFob(normalizedText)   || globalFob   || null;
+    const exp   = extractExp(normalizedText)   || globalExp   || null;
+    const upc   = extractUpc(normalizedText)   || globalUpc   || null;
+    return [{ link, price, units, fob, exp, upc }];
+  }
 
   const products = [];
 
   for (let i = 0; i < matches.length; i++) {
     const link = matches[i][0];
-    const blockStart = matches[i].index;
+    const blockStart = i === 0 ? 0 : matches[i - 1].index + matches[i - 1][0].length;
     const blockEnd   = i < matches.length - 1 ? matches[i + 1].index : normalizedText.length;
     const blockText  = normalizedText.substring(blockStart, blockEnd);
 
@@ -113,8 +143,9 @@ function parseMessage(text) {
     const units = extractUnits(blockText) || globalUnits || null;
     const fob   = extractFob(blockText)   || globalFob   || null;
     const exp   = extractExp(blockText)   || globalExp   || null;
+    const upc   = extractUpc(blockText)   || globalUpc   || null;
 
-    products.push({ link, price, units, fob, exp });
+    products.push({ link, price, units, fob, exp, upc });
   }
 
   return products;
@@ -159,5 +190,6 @@ module.exports = {
   extractPrice,
   extractUnits,
   extractFob,
-  extractExp
+  extractExp,
+  extractUpc
 };

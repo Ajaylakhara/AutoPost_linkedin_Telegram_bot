@@ -172,67 +172,135 @@ function extractProductKey(url) {
   }
 }
 
-// ── UPCitemdb API Lookup (free trial) ─────────────────────────────────────────
+// ── UPC Lookup by Title (API + Query Scraper) ──────────────────────────────
 async function lookupUpcByTitle(title) {
   if (!title || title === 'Product Title' || title === 'Product' || title === 'Amazon.com') return null;
   try {
-    // Use first 5 meaningful words to improve search accuracy
-    const words = title.split(' ').filter(w => w.length > 2).slice(0, 5);
-    const query = words.join(' ');
-    if (!query) return null;
+    // Strip common filler words and keep core 3-5 keywords
+    const cleanQuery = title
+      .replace(/[^\w\s]/gi, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !/^(with|for|and|the|from|item|new|pack|size|color|edition)$/i.test(w))
+      .slice(0, 5)
+      .join(' ');
 
-    const response = await axios.get('https://api.upcitemdb.com/prod/trial/search', {
-      params: { s: query, type: 'product' },
-      timeout: 6000,
-      headers: {
-        'User-Agent': getRandomUserAgent(),
-        'Accept': 'application/json',
-        'Accept-Encoding': 'gzip, deflate'
+    if (!cleanQuery || cleanQuery.length < 3) return null;
+
+    // 1. UPCitemdb trial API search
+    try {
+      const response = await axios.get('https://api.upcitemdb.com/prod/trial/search', {
+        params: { s: cleanQuery, type: 'product' },
+        timeout: 5000,
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'Accept': 'application/json',
+          'Accept-Encoding': 'gzip, deflate'
+        },
+        validateStatus: (status) => status === 200
+      });
+
+      if (response.data?.items?.length > 0) {
+        const item = response.data.items[0];
+        const upc = item.upc || item.ean;
+        if (upc) {
+          console.log(`[Scraper] Found UPC ${upc} from UPCitemdb API for title: "${cleanQuery}"`);
+          return upc;
+        }
       }
-    });
+    } catch (err) {}
 
-    if (response.data?.items?.length > 0) {
-      const item = response.data.items[0];
-      return item.upc || item.ean || null;
-    }
+    // 2. UPCitemdb query HTML scrape fallback
+    try {
+      const queryUrl = `https://www.upcitemdb.com/query?s=${encodeURIComponent(cleanQuery)}&type=2`;
+      const response = await axios.get(queryUrl, {
+        timeout: 5000,
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Referer': 'https://www.google.com/'
+        },
+        validateStatus: (status) => status === 200
+      });
+      const match = response.data.match(/\/upc\/(\d{11,14})/);
+      if (match) {
+        console.log(`[Scraper] Found UPC ${match[1]} from UPCitemdb query for title: "${cleanQuery}"`);
+        return match[1];
+      }
+    } catch (err) {}
+
   } catch (err) {
     // UPC API unavailable or rate limited — silently skip
   }
   return null;
 }
 
-// ── UPCitemdb Page Scraper fallback for ASINs ─────────────────────────────────
+// ── UPC Lookup by ASIN (Multi-Query + API Fallbacks) ──────────────────────────
 async function lookupUpcByAsin(asin) {
   if (!asin) return null;
+
+  // 1. Try UPCitemdb query with type=2, type=1, and plain query
+  const queryUrls = [
+    `https://www.upcitemdb.com/query?s=${asin}&type=2`,
+    `https://www.upcitemdb.com/query?s=${asin}&type=1`,
+    `https://www.upcitemdb.com/query?s=${asin}`
+  ];
+
+  for (const queryUrl of queryUrls) {
+    try {
+      const response = await axios.get(queryUrl, {
+        timeout: 5000,
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': 'https://www.google.com/'
+        },
+        validateStatus: (status) => status === 200
+      });
+
+      const $ = cheerio.load(response.data);
+      let foundUpc = null;
+      $('a').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        const match = href.match(/\/upc\/(\d{11,14})/);
+        if (match) {
+          foundUpc = match[1];
+          return false; // break
+        }
+      });
+
+      if (!foundUpc) {
+        const rawMatch = response.data.match(/\/upc\/(\d{11,14})/);
+        if (rawMatch) foundUpc = rawMatch[1];
+      }
+
+      if (foundUpc) {
+        console.log(`[Scraper] Scraped UPC ${foundUpc} from UPCitemdb query for ASIN: ${asin}`);
+        return foundUpc;
+      }
+    } catch (err) {}
+  }
+
+  // 2. Try UPCitemdb trial API search directly with ASIN
   try {
-    const response = await axios.get(`https://www.upcitemdb.com/query?s=${asin}&type=2`, {
+    const response = await axios.get(`https://api.upcitemdb.com/prod/trial/search?s=${asin}&type=product`, {
       timeout: 5000,
       headers: {
         'User-Agent': getRandomUserAgent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.google.com/'
-      }
+        'Accept': 'application/json'
+      },
+      validateStatus: (status) => status === 200
     });
-
-    const $ = cheerio.load(response.data);
-    let foundUpc = null;
-    $('a').each((_, el) => {
-      const href = $(el).attr('href') || '';
-      const match = href.match(/\/upc\/(\d{12,13})/);
-      if (match) {
-        foundUpc = match[1];
-        return false; // break
+    if (response.data?.items?.length > 0) {
+      const item = response.data.items[0];
+      const upc = item.upc || item.ean;
+      if (upc) {
+        console.log(`[Scraper] Found UPC ${upc} from UPCitemdb API for ASIN: ${asin}`);
+        return upc;
       }
-    });
-
-    if (foundUpc) {
-      console.log(`[Scraper] Scraped UPC ${foundUpc} from UPCitemdb query for ASIN: ${asin}`);
-      return foundUpc;
     }
-  } catch (err) {
-    console.error(`[Scraper] UPCitemdb query scrape failed for ASIN ${asin}: ${err.message}`);
-  }
+  } catch (err) {}
+
   return null;
 }
 
@@ -284,22 +352,15 @@ async function scrapeAmazon(expandedUrl) {
     timeout: 6000,
     maxRedirects: 5,
     headers: {
-      'User-Agent': getRandomUserAgent(),
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Language': 'en-US,en;q=0.5',
       'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'max-age=0',
-      'Connection': 'keep-alive',
-      'Referer': 'https://www.google.com/',
-      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'cross-site',
-      'sec-fetch-user': '?1',
-      'upgrade-insecure-requests': '1',
-      'dnt': '1'
+      'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1'
     }
   });
   return response.data;
@@ -678,19 +739,36 @@ function parseHtml(html, expandedUrl, data) {
     data.imageUrl = getHighResImageUrl(data.imageUrl, expandedUrl);
   }
 
-  // 5. UPC fallback from HTML text
+  // 5. UPC fallback from HTML text, tables, and scripts
   if (data.upc === 'Not Found') {
-    const upcParent = $('span:contains("UPC"), th:contains("UPC"), td:contains("UPC"), .a-span3:contains("UPC")')
-      .first().closest('tr, li, .a-row').text();
+    // 5a. Check Amazon & generic technical detail tables / bullet lists
+    $('#prodDetails tr, #productDetails_techSpec_section_1 tr, #productDetails_db_sections tr, #detailBullets_feature_div li, table.a-keyvalue tr, .po-row').each((_, el) => {
+      const rowText = $(el).text().replace(/\s+/g, ' ').trim();
+      if (/^(?:UPC|GTIN|EAN|Barcode)\b/i.test(rowText) || /\b(?:UPC|GTIN|EAN|Barcode)\s*[:\-#]/i.test(rowText)) {
+        const match = rowText.match(/\b([0-9]{8,14})\b/);
+        if (match && data.upc === 'Not Found') {
+          data.upc = match[1];
+        }
+      }
+    });
 
-    const upcMatch = upcParent.match(/\b([0-9]{12})\b/);
-    if (upcMatch) {
-      data.upc = upcMatch[1];
-    } else {
-      const upcIndex = html.search(/\bUPC\b/i);
+    // 5b. Check labeled tags in HTML
+    if (data.upc === 'Not Found') {
+      const upcParent = $('span:contains("UPC"), th:contains("UPC"), td:contains("UPC"), .a-span3:contains("UPC")')
+        .first().closest('tr, li, .a-row, div').text();
+
+      const upcMatch = upcParent.match(/\b([0-9]{12,14})\b/);
+      if (upcMatch) {
+        data.upc = upcMatch[1];
+      }
+    }
+
+    // 5c. Regex fallback on raw HTML
+    if (data.upc === 'Not Found') {
+      const upcIndex = html.search(/\b(?:UPC|GTIN|EAN)\b/i);
       if (upcIndex !== -1) {
         const substring = html.substring(upcIndex, upcIndex + 300);
-        const rawMatch = substring.match(/\b(\d{12,13})\b/);
+        const rawMatch = substring.match(/\b(\d{11,14})\b/);
         if (rawMatch) data.upc = rawMatch[1];
       }
     }

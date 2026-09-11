@@ -349,27 +349,46 @@ if (bot) {
         const isNew = await db.checkAndAddProductKey(productKey, {
           asin: productKey,
           price: product.price,
-          units: product.units
+          units: product.units,
+          upc: product.upc || null
         });
 
         if (!isNew) {
-          addLog('info', `[Dedupe] Skipping already processed deal: ${productKey}`);
-          continue;
+          const forceMatch = rawText.toLowerCase().includes('force');
+          if (!forceMatch) {
+            addLog('info', `[Dedupe] Skipping already processed deal: ${productKey}`);
+            try {
+              await bot.sendMessage(
+                msg.chat.id,
+                `⚠️ Deal already processed: ${product.link}\n\nTo re-scrape this deal, add the word *force* anywhere in your message.`,
+                { reply_to_message_id: msg.message_id, parse_mode: 'Markdown' }
+              );
+            } catch (tgErr) {
+              addLog('error', `Failed to send dedupe warning: ${tgErr.message}`);
+            }
+            continue;
+          } else {
+            addLog('info', `[Dedupe] User forced re-scrape for deal: ${productKey}`);
+          }
         }
 
         const scraped = await scrapeWithTimeout(product.link);
 
-        const isScrapeFailed = scraped.title === 'Product' || scraped.title === 'Product Title' || (scraped.upc === 'Not Found' && !scraped.imageUrl);
+        const finalUpc = (product.upc && product.upc !== 'Not Found')
+          ? product.upc
+          : (scraped.upc && scraped.upc !== 'Not Found' ? scraped.upc : null);
+
+        const isScrapeFailed = scraped.title === 'Product' || scraped.title === 'Product Title' || (!finalUpc && !scraped.imageUrl);
         if (isScrapeFailed) {
           metrics.failedScrapes++;
           addLog('warning', `Failed to scrape rich data for: ${product.link}`);
         } else {
           metrics.successfulScrapes++;
-          addLog('success', `Scrape successful for "${scraped.title.substring(0, 40)}..."`);
+          addLog('success', `Scrape successful for "${scraped.title.substring(0, 40)}..." (UPC: ${finalUpc || 'None'})`);
         }
 
         const postLines = [];
-        if (scraped.upc && scraped.upc !== 'Not Found')                     postLines.push(`UPC: ${scraped.upc}`);
+        if (finalUpc)                                                       postLines.push(`UPC: ${finalUpc}`);
         if (product.price && product.price !== 'N/A')                       postLines.push(`Price: ${product.price}`);
         if (product.units && product.units !== 'N/A')                       postLines.push(`Units: ${formatUnits(product.units)}`);
         if (product.fob && product.fob !== 'N/A' && product.fob !== 'null') postLines.push(`FOB: ${product.fob}`);
